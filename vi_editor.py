@@ -915,12 +915,12 @@ class ViiEditor:
     # ord("\n") == 10; some terminals report Enter as curses.KEY_ENTER instead.
     _ENTER_KEYS = (curses.KEY_ENTER, 10)
 
-    # Ctrl-V starts block visual mode from NORMAL. Inside the visual modes
-    # Ctrl-X also switches to (or out of) block mode, for terminals that grab
-    # Ctrl-V for paste. Ctrl-X is unbound in every other mode, and unlike
-    # Ctrl-M (delivered as 10, the same key as Enter) it can't arrive as part
-    # of an unbracketed paste.
-    _BLOCK_VISUAL_KEY = 22
+    # Block visual mode is reached only from inside v / V: Ctrl-V, or Ctrl-X
+    # for terminals that grab Ctrl-V for paste, switches to (or out of) it.
+    # Neither key does anything in NORMAL mode, so a Ctrl-V paste keystroke
+    # that leaks through can't start a block there. Ctrl-X is unbound in
+    # every other mode, and unlike Ctrl-M (delivered as 10, the same key as
+    # Enter) it can't arrive as part of an unbracketed paste.
     _BLOCK_VISUAL_KEYS = (22, 24)
 
     # Sentinel recorded in _insert_replay_keys for a line break that came
@@ -1016,9 +1016,9 @@ class ViiEditor:
         "  n N                  next / previous match",
         "  * #                  search word under cursor forward / backward",
         "",
-        "Visual  (v charwise  V linewise  Ctrl-V block)",
+        "Visual  (v charwise  V linewise; then Ctrl-V block)",
         "  o                    swap cursor to other end of selection",
-        "  Ctrl-X               switch to / out of block (alternative to Ctrl-V)",
+        "  Ctrl-V Ctrl-X        in v / V: switch to block; in block: leave it",
         "  O                    block: other end of the current row",
         "  all movement keys    extend selection",
         "  d x  y  c s         delete / yank / change selection",
@@ -13413,12 +13413,6 @@ set errorcolor=black          " error message text colour on the bottom line
             self._count_str = ""
             self.mode         = Mode.VISUAL_LINE
             self.visual_start = (self.cursor_row, self.cursor_col)
-
-        elif key == self._BLOCK_VISUAL_KEY:    # Ctrl-V
-            self._count_str = ""
-            self.mode           = Mode.VISUAL_BLOCK
-            self.visual_start   = (self.cursor_row, self.cursor_col)
-            self._block_to_eol  = False
 
         # --- File info (Ctrl-G) ---
         elif key == 7:

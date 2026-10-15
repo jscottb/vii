@@ -9232,7 +9232,8 @@ class VisualModeTests(unittest.TestCase):
         editor.lines = list(lines)
         editor.line_endings = ["\n"] * len(lines)
         editor.cursor_row, editor.cursor_col = start
-        editor._handle_normal(22, 24, 80)
+        editor._handle_normal(ord("v"), 24, 80)
+        editor._handle_visual(22)
         return VisualModeTests._feed_keys(editor, keys)
 
     @staticmethod
@@ -9247,7 +9248,7 @@ class VisualModeTests(unittest.TestCase):
                 editor._handle_normal(key, 24, 80)
         return editor
 
-    def test_ctrl_v_enters_block_mode_and_toggles_between_visual_modes(self):
+    def test_ctrl_v_switches_from_visual_into_block_mode_and_toggles(self):
         editor = self._block_editor(["abc"], (0, 1))
         self.assertEqual(editor.mode, Mode.VISUAL_BLOCK)
         self.assertEqual(editor.visual_start, (0, 1))
@@ -9274,10 +9275,10 @@ class VisualModeTests(unittest.TestCase):
         self.assertEqual(editor.mode, Mode.NORMAL)
         self.assertEqual(editor.lines, ["abc", "def"])
 
-    def test_ctrl_x_and_ctrl_n_do_nothing_in_normal_mode(self):
-        # Ctrl-X is the visual-mode-only alternative to Ctrl-V, and Ctrl-N
-        # (its predecessor) belongs to insert-mode completion.
-        for key in (24, 14):
+    def test_ctrl_v_ctrl_x_and_ctrl_n_do_nothing_in_normal_mode(self):
+        # Block mode is reached only from inside v / V, so neither Ctrl-V nor
+        # Ctrl-X starts it from NORMAL; Ctrl-N belongs to insert completion.
+        for key in (22, 24, 14):
             with self.subTest(key=key):
                 editor = ViEditor()
                 editor.lines = ["abc", "def"]
@@ -9436,7 +9437,8 @@ class VisualModeTests(unittest.TestCase):
         editor._handle_normal(ord("d"), 24, 80)   # an earlier, unrelated change
         editor._store_register(["Z"], False)
         editor._move(0, 1)
-        editor._handle_normal(22, 24, 80)
+        editor._handle_normal(ord("v"), 24, 80)
+        editor._handle_visual(22)
         for key in "jlp":
             editor._handle_visual(ord(key))
         self.assertEqual(editor.lines, ["eZh", "iZl", "mnop"])
@@ -9553,7 +9555,8 @@ class VisualModeTests(unittest.TestCase):
         editor = ViEditor()
         editor.tab_stop = 8
         editor.lines = ["\tx", "abcdefghij"]
-        editor._handle_normal(22, 24, 80)
+        editor._handle_normal(ord("v"), 24, 80)
+        editor._handle_visual(22)
         for key in "jld":
             editor._handle_visual(ord(key))
         # The tab covers display columns 0-7, so the block spans them all.

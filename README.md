@@ -75,12 +75,12 @@ words from the buffer.
 | --- | --- |
 | `v` | characters |
 | `V` | whole lines |
-| `Ctrl-V` | a rectangular block |
+| `Ctrl-V` or `Ctrl-X`, from `v` or `V` | a rectangular block |
 
 The same keys switch between modes, and pressing the current mode's key leaves
-it. In a visual mode `Ctrl-X` also switches to (or out of) block mode, for
-terminals that use `Ctrl-V` for paste: start with `v` or `V`, then press
-`Ctrl-X`.
+it. Block mode is only reached from inside another visual mode: press `v` or
+`V`, then `Ctrl-V` (or `Ctrl-X`, for terminals that use `Ctrl-V` for paste).
+Neither key does anything in normal mode.
 
 All motions extend the selection. `d y c > < ~ J` act on it, `p` / `P`
 replace it with a register, and `:` opens the command line with the selected
