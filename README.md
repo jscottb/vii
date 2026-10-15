@@ -75,12 +75,12 @@ words from the buffer.
 | --- | --- |
 | `v` | characters |
 | `V` | whole lines |
-| `Ctrl-V` or `Ctrl-M` | a rectangular block |
+| `Ctrl-V` | a rectangular block |
 
 The same keys switch between modes, and pressing the current mode's key leaves
-it. `Ctrl-M` is there for terminals that use `Ctrl-V` for paste. Because a
-terminal sends Enter and `Ctrl-M` as the same key, Enter also starts block mode
-from normal mode.
+it. In a visual mode `Ctrl-X` also switches to (or out of) block mode, for
+terminals that use `Ctrl-V` for paste: start with `v` or `V`, then press
+`Ctrl-X`.
 
 All motions extend the selection. `d y c > < ~ J` act on it, `p` / `P`
 replace it with a register, and `:` opens the command line with the selected
@@ -199,7 +199,7 @@ Run `:set` with no arguments to see every current value. The main options:
 
 I started vii as a weekend project - It's my (I think) 12th editor I have written,
 the third vi style editor, and the second editor I've done in Python. The others
-were in Asm (early one), and C for most of them.
+were in Asm (early ones), and C for the rest of them.
 
 The whole editor lives in `vi_editor.py`, almost all of it in the `ViiEditor`
 class. The tests in `test_vi_editor.py` use `unittest` and run under pytest:

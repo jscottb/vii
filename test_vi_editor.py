@@ -9233,6 +9233,10 @@ class VisualModeTests(unittest.TestCase):
         editor.line_endings = ["\n"] * len(lines)
         editor.cursor_row, editor.cursor_col = start
         editor._handle_normal(22, 24, 80)
+        return VisualModeTests._feed_keys(editor, keys)
+
+    @staticmethod
+    def _feed_keys(editor, keys):
         for key in keys:
             key = ord(key) if isinstance(key, str) else key
             if editor.mode == Mode.INSERT:
@@ -9254,26 +9258,56 @@ class VisualModeTests(unittest.TestCase):
         editor._handle_visual(22)
         self.assertEqual(editor.mode, Mode.NORMAL)
 
-    def test_ctrl_m_switches_visual_modes_like_ctrl_v(self):
-        for ctrl_m in (13, 10):   # raw CR, and CR after curses' nl() mapping
-            with self.subTest(key=ctrl_m):
+    def test_ctrl_x_switches_visual_modes_like_ctrl_v(self):
+        editor = ViEditor()
+        editor.lines = ["abc", "def"]
+        editor.cursor_col = 1
+        editor._handle_normal(ord("v"), 24, 80)
+        editor._handle_visual(24)
+        self.assertEqual(editor.mode, Mode.VISUAL_BLOCK)
+        self.assertEqual(editor.visual_start, (0, 1))
+        editor._handle_visual(ord("V"))
+        self.assertEqual(editor.mode, Mode.VISUAL_LINE)
+        editor._handle_visual(24)
+        self.assertEqual(editor.mode, Mode.VISUAL_BLOCK)
+        editor._handle_visual(24)
+        self.assertEqual(editor.mode, Mode.NORMAL)
+        self.assertEqual(editor.lines, ["abc", "def"])
+
+    def test_ctrl_x_and_ctrl_n_do_nothing_in_normal_mode(self):
+        # Ctrl-X is the visual-mode-only alternative to Ctrl-V, and Ctrl-N
+        # (its predecessor) belongs to insert-mode completion.
+        for key in (24, 14):
+            with self.subTest(key=key):
                 editor = ViEditor()
                 editor.lines = ["abc", "def"]
                 editor.cursor_col = 1
-                editor._handle_normal(ctrl_m, 24, 80)
-                self.assertEqual(editor.mode, Mode.VISUAL_BLOCK)
-                self.assertEqual(editor.visual_start, (0, 1))
-                editor._handle_visual(ord("V"))
-                self.assertEqual(editor.mode, Mode.VISUAL_LINE)
-                editor._handle_visual(ctrl_m)
-                self.assertEqual(editor.mode, Mode.VISUAL_BLOCK)
-                editor._handle_visual(ord("v"))
-                self.assertEqual(editor.mode, Mode.VISUAL)
-                editor._handle_visual(ctrl_m)
-                self.assertEqual(editor.mode, Mode.VISUAL_BLOCK)
-                editor._handle_visual(ctrl_m)
+                editor._handle_normal(key, 24, 80)
                 self.assertEqual(editor.mode, Mode.NORMAL)
+                self.assertEqual((editor.cursor_row, editor.cursor_col), (0, 1))
                 self.assertEqual(editor.lines, ["abc", "def"])
+                self.assertFalse(editor.modified)
+
+    def test_ctrl_n_does_not_switch_visual_modes(self):
+        editor = ViEditor()
+        editor.lines = ["abc"]
+        editor._handle_normal(ord("v"), 24, 80)
+        editor._handle_visual(14)
+        self.assertEqual(editor.mode, Mode.VISUAL)
+
+    def test_enter_and_ctrl_m_do_not_start_block_mode(self):
+        # An unbracketed paste delivers its newlines as 10/13; they must not
+        # toggle block mode and turn the pasted letters into block operators.
+        for key in (10, 13):
+            with self.subTest(key=key):
+                editor = ViEditor()
+                editor.lines = ["abc", "def"]
+                editor._handle_normal(key, 24, 80)
+                self.assertNotEqual(editor.mode, Mode.VISUAL_BLOCK)
+                editor.mode = Mode.NORMAL
+                editor._handle_normal(ord("v"), 24, 80)
+                editor._handle_visual(key)
+                self.assertNotEqual(editor.mode, Mode.VISUAL_BLOCK)
 
     def test_block_delete_removes_column_into_blockwise_register(self):
         editor = self._block_editor(["abcdef", "ghijkl", "mnopqr"], (0, 1), "jjlld")
@@ -9438,6 +9472,75 @@ class VisualModeTests(unittest.TestCase):
         editor._handle_normal(ord("p"), 24, 80)
         self.assertEqual(editor.lines, ["abc1", "   2", "   3"])
         self.assertEqual(editor.line_endings, ["\n", "\n", ""])
+
+    def test_block_append_refuses_padding_past_limit(self):
+        editor = self._block_editor(["x" * 40, "", "", ""], (0, 39))
+        editor.BLOCK_PAD_LIMIT = 50
+        self._feed_keys(editor, ["j", "j", "j", "A"])
+        self.assertEqual(editor.mode, Mode.NORMAL)
+        self.assertEqual(editor.lines, ["x" * 40, "", "", ""])
+        self.assertTrue(editor.message_is_error)
+        self.assertFalse(editor.undo_stack)
+        self.assertIsNone(editor._block_insert)
+
+    def test_block_append_padding_exactly_at_limit_is_allowed(self):
+        editor = self._block_editor(["x" * 10, "", ""], (0, 9))
+        editor.BLOCK_PAD_LIMIT = 20
+        self._feed_keys(editor, ["j", "j", "A", "Z", 27])
+        self.assertEqual(editor.lines, ["x" * 10 + "Z", " " * 10 + "Z", " " * 10 + "Z"])
+
+    def test_block_append_dot_repeat_refused_does_not_type_into_normal_mode(self):
+        editor = self._block_editor(["ab", "cd", "x" * 40, "", ""], (0, 0), ["j", "A", "Z", 27])
+        self.assertEqual(editor.lines[:2], ["aZb", "cZd"])
+        editor.BLOCK_PAD_LIMIT = 30
+        undo_depth = len(editor.undo_stack)
+        editor._move(2, 39)
+        editor._handle_normal(ord("."), 24, 80)
+        self.assertEqual(editor.mode, Mode.NORMAL)
+        self.assertEqual(editor.lines, ["aZb", "cZd", "x" * 40, "", ""])
+        self.assertTrue(editor.message_is_error)
+        self.assertEqual(len(editor.undo_stack), undo_depth)
+
+    def test_block_put_refuses_padding_past_limit(self):
+        editor = ViEditor()
+        editor.lines = ["y" * 40]
+        editor.line_endings = [""]
+        editor.BLOCK_PAD_LIMIT = 50
+        editor._store_register(["q", "q", "q"], False, blockwise=True)
+        editor._move(0, 39)
+        editor._handle_normal(ord("p"), 24, 80)
+        self.assertEqual(editor.lines, ["y" * 40])
+        self.assertEqual(editor.line_endings, [""])
+        self.assertTrue(editor.message_is_error)
+        self.assertFalse(editor.undo_stack)
+        self.assertFalse(editor.modified)
+
+    def test_block_paste_over_selection_refuses_padding_past_limit(self):
+        # Both corners on long rows keep the block at column 39 over the
+        # two empty rows between them: 2 x 39 padding cells > 50.
+        lines = ["x" * 40, "", "", "x" * 40]
+        editor = self._block_editor(lines, (0, 39), "jjj")
+        self.assertEqual(editor._visual_block_bounds(), (0, 3, 39, 39))
+        editor.BLOCK_PAD_LIMIT = 50
+        editor._store_register(["Z"], False)
+        editor._handle_visual(ord("p"))
+        self.assertEqual(editor.lines, lines)
+        self.assertEqual(editor.yank_buffer, ["Z"])
+        self.assertTrue(editor.message_is_error)
+        self.assertFalse(editor.undo_stack)
+
+    def test_block_paste_over_selection_dot_repeat_refuses_padding_past_limit(self):
+        editor = self._block_editor(["abcd", "efgh", "x" * 40, "", ""], (0, 1), "j")
+        editor._store_register(["Z"], False)
+        editor._handle_visual(ord("p"))
+        self.assertEqual(editor.lines[:2], ["aZcd", "eZgh"])
+        editor.BLOCK_PAD_LIMIT = 30
+        undo_depth = len(editor.undo_stack)
+        editor._move(2, 39)
+        editor._handle_normal(ord("."), 24, 80)
+        self.assertEqual(editor.lines, ["aZcd", "eZgh", "x" * 40, "", ""])
+        self.assertTrue(editor.message_is_error)
+        self.assertEqual(len(editor.undo_stack), undo_depth)
 
     def test_block_other_corner_swaps_columns_on_same_row(self):
         editor = self._block_editor(["abcdef", "ghijkl"], (0, 1), "jll")

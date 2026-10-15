@@ -915,11 +915,13 @@ class ViiEditor:
     # ord("\n") == 10; some terminals report Enter as curses.KEY_ENTER instead.
     _ENTER_KEYS = (curses.KEY_ENTER, 10)
 
-    # Ctrl-V, plus Ctrl-M as an alternative for terminals that grab Ctrl-V
-    # for paste. Ctrl-M is CR (13), which curses' default nl() translation
-    # delivers as 10 -- the same key as Enter, which has no NORMAL/VISUAL
-    # binding of its own.
-    _BLOCK_VISUAL_KEYS = (22, 13, 10)
+    # Ctrl-V starts block visual mode from NORMAL. Inside the visual modes
+    # Ctrl-X also switches to (or out of) block mode, for terminals that grab
+    # Ctrl-V for paste. Ctrl-X is unbound in every other mode, and unlike
+    # Ctrl-M (delivered as 10, the same key as Enter) it can't arrive as part
+    # of an unbracketed paste.
+    _BLOCK_VISUAL_KEY = 22
+    _BLOCK_VISUAL_KEYS = (22, 24)
 
     # Sentinel recorded in _insert_replay_keys for a line break that came
     # from a bracketed paste, so a later `.` or count-repeat replays it via
@@ -1014,8 +1016,9 @@ class ViiEditor:
         "  n N                  next / previous match",
         "  * #                  search word under cursor forward / backward",
         "",
-        "Visual  (v charwise  V linewise  Ctrl-V or Ctrl-M block)",
+        "Visual  (v charwise  V linewise  Ctrl-V block)",
         "  o                    swap cursor to other end of selection",
+        "  Ctrl-X               switch to / out of block (alternative to Ctrl-V)",
         "  O                    block: other end of the current row",
         "  all movement keys    extend selection",
         "  d x  y  c s         delete / yank / change selection",
@@ -4786,6 +4789,29 @@ set errorcolor=black          " error message text colour on the bottom line
 
     _BLOCK_EOL = 1 << 60
 
+    # Cap on the spaces one block put / A may add to bring short rows out to
+    # the block's column. A block anchored deep in a long line over many short
+    # rows otherwise grows by (line width x rows) from a single keystroke.
+    BLOCK_PAD_LIMIT = 8_000_000
+
+    def _block_pad_cells(self, row: int, nrows: int, vcol: int) -> int:
+        """Spaces needed to bring rows row..row+nrows-1 out to display
+        column vcol (rows past the buffer end count as empty)."""
+        total = 0
+        for r in range(row, row + nrows):
+            w = self._display_width(self.lines[r]) if r < len(self.lines) else 0
+            total += max(0, vcol - w)
+        return total
+
+    def _block_pad_refused(self, row: int, nrows: int, vcol: int) -> bool:
+        """Set an error and return True when padding rows row.. out to vcol
+        would exceed BLOCK_PAD_LIMIT. Callers check before changing anything."""
+        if self._block_pad_cells(row, nrows, vcol) <= self.BLOCK_PAD_LIMIT:
+            return False
+        self._set_error("Block too wide to pad short lines; aborted")
+        self._force_redraw = True
+        return True
+
     def _block_vcol(self, row: int, col: int) -> int:
         """Display column where character `col` of `row` starts."""
         return self._display_width(self.lines[row][:col])
@@ -4992,15 +5018,17 @@ set errorcolor=black          " error message text colour on the bottom line
         # size the clamp by padded cells, not by the register's raw text.
         width = max((self._display_width(p) for p in pieces), default=0)
         unit_size = max(1, width * len(pieces))
-        if unit_size * count > self.MAX_COUNT:
-            count = max(1, self.MAX_COUNT // unit_size)
-            self._set_error("Count too large for register contents; clamped")
-        self._push_undo()
         row = self.cursor_row
         if after and self.lines[row]:
             vcol = self._block_char_extent(row, self.cursor_col)[1] + 1
         else:
             vcol = self._block_vcol(row, self.cursor_col)
+        if self._block_pad_refused(row, len(pieces), vcol):
+            return
+        if unit_size * count > self.MAX_COUNT:
+            count = max(1, self.MAX_COUNT // unit_size)
+            self._set_error("Count too large for register contents; clamped")
+        self._push_undo()
         col = self._put_block_text(list(pieces), row, vcol, count)
         self._move(row, col)
         self.modified = True
@@ -5022,12 +5050,16 @@ set errorcolor=black          " error message text colour on the bottom line
             self._force_redraw = True
             return
         r1, r2, vl, vr = self._visual_block_bounds()
+        as_column = src_is_block or (not put_is_lines and len(put_buffer) == 1)
+        if as_column:
+            pieces = list(put_buffer) if src_is_block else put_buffer * (r2 - r1 + 1)
+            if self._block_pad_refused(r1, len(pieces), vl):
+                return
         self.mode = Mode.NORMAL
         self._push_undo()
         deleted = self._block_delete_rows(r1, r2, vl, vr)
-        if src_is_block or (not put_is_lines and len(put_buffer) == 1):
-            pieces = list(put_buffer) if src_is_block else put_buffer * (r2 - r1 + 1)
-            col = self._put_block_text(pieces, r1, vl)
+        if as_column:
+            col =self._put_block_text(pieces, r1, vl)
             self._move(r1, col)
             self._set_last_change(
                 lambda h=r2 - r1 + 1, w=vr - vl + 1, eol=vr == self._BLOCK_EOL,
@@ -5059,6 +5091,8 @@ set errorcolor=black          " error message text colour on the bottom line
         Single-line text fills however many rows the new block has (fewer
         near the end of the buffer); a block register is put whole."""
         pieces = list(text) if is_block else list(text) * (r2 - r1 + 1)
+        if self._block_pad_refused(r1, len(pieces), vl):
+            return
         self._push_undo()
         self._block_delete_rows(r1, r2, vl, vr)
         self._move(r1, self._put_block_text(pieces, r1, vl))
@@ -5082,6 +5116,11 @@ set errorcolor=black          " error message text colour on the bottom line
         text typed on the first row is copied onto the rest of the block
         when insert mode ends -- see _finish_block_insert."""
         to_eol = vr == self._BLOCK_EOL
+        # A pads the first row now and the rest on ESC (_finish_block_insert);
+        # refuse before entering INSERT so nothing is half-done.
+        if kind == "A" and not to_eol and self._block_pad_refused(r1, r2 - r1 + 1, vr + 1):
+            self._block_rest_cursor(r1, vl)
+            return
         self._enter_insert()
         if kind == "c":
             if self._block_will_change(r1, r2, vl, vr):
@@ -12153,6 +12192,10 @@ set errorcolor=black          " error message text colour on the bottom line
             if i == 0:
                 if setup is not None:
                     setup()
+                    if self.mode not in (Mode.INSERT, Mode.REPLACE):
+                        # setup refused (e.g. a block A too wide to pad);
+                        # don't replay the typed keys into NORMAL mode.
+                        return
                 else:
                     if mode == Mode.REPLACE:
                         self._enter_replace()
@@ -13371,7 +13414,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self.mode         = Mode.VISUAL_LINE
             self.visual_start = (self.cursor_row, self.cursor_col)
 
-        elif key in self._BLOCK_VISUAL_KEYS:    # Ctrl-V / Ctrl-M
+        elif key == self._BLOCK_VISUAL_KEY:    # Ctrl-V
             self._count_str = ""
             self.mode           = Mode.VISUAL_BLOCK
             self.visual_start   = (self.cursor_row, self.cursor_col)
@@ -14505,7 +14548,7 @@ set errorcolor=black          " error message text colour on the bottom line
             else:
                 self.mode = Mode.VISUAL_LINE
 
-        elif key in self._BLOCK_VISUAL_KEYS:    # Ctrl-V / Ctrl-M
+        elif key in self._BLOCK_VISUAL_KEYS:    # Ctrl-V / Ctrl-X
             if self.mode == Mode.VISUAL_BLOCK:
                 self._clear_active_register()
                 self.mode = Mode.NORMAL
