@@ -9544,6 +9544,85 @@ class VisualModeTests(unittest.TestCase):
         self.assertTrue(editor.message_is_error)
         self.assertEqual(len(editor.undo_stack), undo_depth)
 
+    def test_block_put_refuses_piece_width_padding_past_limit(self):
+        # One wide piece and four empty ones: each empty piece is padded to
+        # 20 columns because text follows it, 5 x 20 = 100 cells > 50.
+        editor = ViEditor()
+        editor.lines = ["ab"] * 5
+        editor.line_endings = ["\n"] * 5
+        editor.BLOCK_PAD_LIMIT = 50
+        editor._store_register(["W" * 20] + [""] * 4, False, blockwise=True)
+        editor._handle_normal(ord("P"), 24, 80)
+        self.assertEqual(editor.lines, ["ab"] * 5)
+        self.assertTrue(editor.message_is_error)
+        self.assertNotIn("clamped", editor.message)
+        self.assertFalse(editor.undo_stack)
+        self.assertFalse(editor.modified)
+
+    def test_block_put_single_copy_over_count_cap_is_not_reported_clamped(self):
+        editor = ViEditor()
+        editor.lines = ["xy", "xy"]
+        editor.line_endings = ["\n", "\n"]
+        editor.MAX_COUNT = 4   # one copy is 3 x 2 = 6 cells
+        editor._store_register(["abc", "def"], False, blockwise=True)
+        editor._handle_normal(ord("P"), 24, 80)
+        self.assertEqual(editor.lines, ["abcxy", "defxy"])
+        self.assertFalse(editor.message_is_error)
+
+    def test_block_paste_over_selection_refuses_piece_width_padding_past_limit(self):
+        lines = ["abcd"] * 5
+        editor = self._block_editor(lines, (0, 0), "jjjj")
+        editor.BLOCK_PAD_LIMIT = 50
+        editor._store_register(["W" * 20] + [""] * 4, False, blockwise=True)
+        editor._handle_visual(ord("p"))
+        self.assertEqual(editor.lines, lines)
+        self.assertTrue(editor.message_is_error)
+        self.assertFalse(editor.undo_stack)
+
+    def test_block_paste_refusal_keeps_selected_register_for_retry(self):
+        lines = ["x" * 40, "", "", "x" * 40]
+        editor = self._block_editor(lines, (0, 39), "jjj")
+        editor.active_register = "a"
+        editor._store_register(["Z"], False)
+        editor._store_register(["U"], False)   # unnamed only
+        editor.BLOCK_PAD_LIMIT = 50
+        for key in '"ap':
+            editor._handle_visual(ord(key))
+        self.assertEqual(editor.lines, lines)
+        self.assertEqual(editor.mode, Mode.VISUAL_BLOCK)
+        self.assertEqual(editor.active_register, "a")
+
+        editor.BLOCK_PAD_LIMIT = 10_000
+        editor._handle_visual(ord("p"))
+        self.assertEqual(editor.mode, Mode.NORMAL)
+        self.assertEqual(editor.lines[1], " " * 39 + "Z")
+        self.assertFalse(any("U" in line for line in editor.lines))
+
+    def test_block_paste_from_empty_register_keeps_selected_register(self):
+        editor = self._block_editor(["abc", "def"], (0, 0), "j")
+        for key in '"bp':
+            editor._handle_visual(ord(key))
+        self.assertTrue(editor.message_is_error)
+        self.assertEqual(editor.mode, Mode.VISUAL_BLOCK)
+        self.assertEqual(editor.active_register, "b")
+
+    def test_block_insert_too_large_to_repeat_changes_first_row_only(self):
+        editor = self._block_editor(["ab"] * 4, (0, 0), "jjjI")
+        editor.BLOCK_PAD_LIMIT = 20   # 10 chars x 3 more rows = 30 cells
+        self._feed_keys(editor, ["Q"] * 10 + [27])
+        self.assertEqual(editor.mode, Mode.NORMAL)
+        self.assertEqual(editor.lines, ["Q" * 10 + "ab", "ab", "ab", "ab"])
+        self.assertTrue(editor.message_is_error)
+        editor._handle_normal(ord("u"), 24, 80)
+        self.assertEqual(editor.lines, ["ab"] * 4)
+
+    def test_block_insert_repeat_exactly_at_limit_is_allowed(self):
+        editor = self._block_editor(["ab"] * 4, (0, 0), "jjjI")
+        editor.BLOCK_PAD_LIMIT = 30
+        self._feed_keys(editor, ["Q"] * 10 + [27])
+        self.assertEqual(editor.lines, ["Q" * 10 + "ab"] * 4)
+        self.assertFalse(editor.message_is_error)
+
     def test_block_other_corner_swaps_columns_on_same_row(self):
         editor = self._block_editor(["abcdef", "ghijkl"], (0, 1), "jll")
         editor._handle_visual(ord("O"))

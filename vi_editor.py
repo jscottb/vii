@@ -4803,14 +4803,22 @@ set errorcolor=black          " error message text colour on the bottom line
             total += max(0, vcol - w)
         return total
 
-    def _block_pad_refused(self, row: int, nrows: int, vcol: int) -> bool:
-        """Set an error and return True when padding rows row.. out to vcol
-        would exceed BLOCK_PAD_LIMIT. Callers check before changing anything."""
-        if self._block_pad_cells(row, nrows, vcol) <= self.BLOCK_PAD_LIMIT:
+    def _block_pad_refused(self, row: int, nrows: int, vcol: int,
+                           payload: int = 0) -> bool:
+        """Set an error and return True when padding rows row.. out to vcol,
+        plus the `payload` cells the operation itself inserts (pieces padded
+        to the block width), would exceed BLOCK_PAD_LIMIT. Callers check
+        before changing anything."""
+        if self._block_pad_cells(row, nrows, vcol) + payload <= self.BLOCK_PAD_LIMIT:
             return False
         self._set_error("Block too wide to pad short lines; aborted")
         self._force_redraw = True
         return True
+
+    def _block_payload_cells(self, pieces: List[str]) -> int:
+        """Upper bound on the cells one put of `pieces` inserts: every piece
+        is padded to the widest one when text follows it."""
+        return max((self._display_width(p) for p in pieces), default=0) * len(pieces)
 
     def _block_vcol(self, row: int, col: int) -> int:
         """Display column where character `col` of `row` starts."""
@@ -5023,11 +5031,14 @@ set errorcolor=black          " error message text colour on the bottom line
             vcol = self._block_char_extent(row, self.cursor_col)[1] + 1
         else:
             vcol = self._block_vcol(row, self.cursor_col)
-        if self._block_pad_refused(row, len(pieces), vcol):
+        # One copy must fit outright; extra copies are what the count clamp trims.
+        if self._block_pad_refused(row, len(pieces), vcol, unit_size):
             return
         if unit_size * count > self.MAX_COUNT:
-            count = max(1, self.MAX_COUNT // unit_size)
-            self._set_error("Count too large for register contents; clamped")
+            clamped = max(1, self.MAX_COUNT // unit_size)
+            if clamped < count:
+                count = clamped
+                self._set_error("Count too large for register contents; clamped")
         self._push_undo()
         col = self._put_block_text(list(pieces), row, vcol, count)
         self._move(row, col)
@@ -5042,9 +5053,13 @@ set errorcolor=black          " error message text colour on the bottom line
         """v_b_p / v_b_P: replace the block with the register. A block or a
         single line of text fills the block column-wise; multi-line text has
         no column shape, so it's put as ordinary text at the block."""
+        # Resolving the source consumes a "x prefix; on an early return that
+        # stays in VISUAL_BLOCK, restore it so a retried p reads the same register.
+        register = self.active_register
         src_is_block = self._pending_put_is_block()
         put_buffer, put_is_lines, put_line_endings = self._resolve_put_source()
         if self._put_source_is_empty(put_buffer, put_is_lines):
+            self.active_register = register
             self.message = "Nothing in register"
             self.message_is_error = True
             self._force_redraw = True
@@ -5053,13 +5068,14 @@ set errorcolor=black          " error message text colour on the bottom line
         as_column = src_is_block or (not put_is_lines and len(put_buffer) == 1)
         if as_column:
             pieces = list(put_buffer) if src_is_block else put_buffer * (r2 - r1 + 1)
-            if self._block_pad_refused(r1, len(pieces), vl):
+            if self._block_pad_refused(r1, len(pieces), vl, self._block_payload_cells(pieces)):
+                self.active_register = register
                 return
         self.mode = Mode.NORMAL
         self._push_undo()
         deleted = self._block_delete_rows(r1, r2, vl, vr)
         if as_column:
-            col =self._put_block_text(pieces, r1, vl)
+            col = self._put_block_text(pieces, r1, vl)
             self._move(r1, col)
             self._set_last_change(
                 lambda h=r2 - r1 + 1, w=vr - vl + 1, eol=vr == self._BLOCK_EOL,
@@ -5091,7 +5107,7 @@ set errorcolor=black          " error message text colour on the bottom line
         Single-line text fills however many rows the new block has (fewer
         near the end of the buffer); a block register is put whole."""
         pieces = list(text) if is_block else list(text) * (r2 - r1 + 1)
-        if self._block_pad_refused(r1, len(pieces), vl):
+        if self._block_pad_refused(r1, len(pieces), vl, self._block_payload_cells(pieces)):
             return
         self._push_undo()
         self._block_delete_rows(r1, r2, vl, vr)
@@ -5173,6 +5189,11 @@ set errorcolor=black          " error message text colour on the bottom line
         if delta <= 0 or new[:col] != orig[:col] or new[col + delta:] != orig[col:]:
             return None
         text = new[col:col + delta]
+        if len(text) * (info["r2"] - r1) > self.BLOCK_PAD_LIMIT:
+            # e.g. a long single-line paste over many rows. The first row's
+            # insert stands (it is already this insert's undo step).
+            self._set_error("Block insert too large to repeat on every row; first row only")
+            return (r1, col)
         vl, vr = info["vl"], info["vr"]
         for row in range(r1 + 1, info["r2"] + 1):
             line = self.lines[row]
