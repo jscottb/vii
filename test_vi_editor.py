@@ -1,9 +1,12 @@
 import curses
 import errno
 import os
+import pty
+import select
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -13,6 +16,10 @@ import unittest
 from unittest import mock
 import base64
 import json
+import contextlib
+import inspect
+import random
+import tracemalloc
 
 from vi_editor import (
     FileBrowserEntry, FindMotion, GotoMotion, GrepResult, MMapLineStore, Mode,
@@ -1351,6 +1358,211 @@ class ExCommandTests(unittest.TestCase):
             self.assertEqual(editor.lines, ["Xalpha", "beta"])
             self.assertTrue(editor.modified)
 
+    # --- MMapLineStore: storage, bulk reads, external changes --------------
+
+    @staticmethod
+    def _mapped_editor(path):
+        editor = _editor_with_rc()
+        editor.LARGE_FILE_MMAP_THRESHOLD = 1
+        editor._load_file(path)
+        del editor.LARGE_FILE_MMAP_THRESHOLD
+        return editor
+
+    _MMAP_SAMPLES = [
+        b"a", b"a\n", b"a\nb", b"a\r\nb\r\n", b"a\rb\r", b"\n", b"\r\n", b"\r",
+        b"\n\n\n", b"a\r\r\nb", b"x\r\n\ry\n\r", b"caf\xc3\xa9\nbad \xff\xfe\n",
+        b"tab\there\n\nlast",
+    ]
+
+    def _assert_store_matches_split(self, data, chunk=None):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "f")
+            with open(path, "wb") as fh:
+                fh.write(data)
+            want_lines, want_endings = ViEditor._split_bytes_with_line_endings(data)
+            patch = (mock.patch.object(MMapLineStore, "MATERIALIZE_CHUNK", chunk)
+                     if chunk else contextlib.nullcontext())
+            with patch:
+                store = MMapLineStore(path)
+                try:
+                    self.assertEqual(len(store), len(want_lines))
+                    self.assertEqual(list(store), want_lines)
+                    self.assertEqual(store[1:3], want_lines[1:3])
+                    self.assertEqual(store[-1], want_lines[-1])
+                    self.assertEqual(store.line_endings(), want_endings)
+                    self.assertEqual(
+                        [store.line_ending_at(i) for i in range(len(store))], want_endings)
+                    self.assertIsNone(store.line_ending_at(len(store)))
+                    self.assertEqual(store._materialize(), want_lines)
+                finally:
+                    store.close()
+
+    def test_mmap_store_splits_like_the_small_file_path(self):
+        for data in self._MMAP_SAMPLES:
+            with self.subTest(data=data):
+                self._assert_store_matches_split(data)
+
+    def test_mmap_store_matches_small_file_path_on_random_input(self):
+        rng = random.Random(7)
+        pieces = [b"a", b"b", b"\n", b"\r", b"\r\n", b"\xff", b"\xc3\xa9", b" ", b"\n\n"]
+        for _ in range(200):
+            data = b"".join(rng.choice(pieces) for _ in range(rng.randint(1, 60)))
+            with self.subTest(data=data):
+                # A tiny chunk makes materialize/iteration cross many batches.
+                self._assert_store_matches_split(data, chunk=5)
+
+    def test_mmap_store_index_is_compact(self):
+        # 100k lines: the old list of (start, end) tuples plus a list of
+        # ending strings cost ~13 MB; offsets in an array are ~0.9 MB.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "big.log")
+            with open(path, "w") as fh:
+                fh.writelines(f"line {i}\n" for i in range(100_000))
+            tracemalloc.start()
+            try:
+                store = MMapLineStore(path)
+                used, _ = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            try:
+                self.assertEqual(len(store), 100_000)
+                self.assertEqual(store[99_999], "line 99999")
+                self.assertLess(used, 3_000_000)
+            finally:
+                store.close()
+
+    def test_mmap_store_bulk_reads_stat_the_file_once(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "f")
+            with open(path, "w") as fh:
+                fh.writelines(f"row {i}\n" for i in range(1000))
+            store = MMapLineStore(path)
+            try:
+                with mock.patch("vi_editor.os.fstat", wraps=os.fstat) as fstat:
+                    self.assertEqual(len(list(store)), 1000)
+                    self.assertEqual(len(store[0:1000]), 1000)
+                self.assertLessEqual(fstat.call_count, 2)
+                with mock.patch("vi_editor.os.fstat", wraps=os.fstat) as fstat:
+                    store._materialize()
+                self.assertLessEqual(fstat.call_count, 1)
+            finally:
+                store.close()
+
+    def test_mmap_store_iteration_follows_materialization_midway(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "f")
+            with open(path, "w") as fh:
+                fh.write("a\nb\nc\nd\n")
+            with mock.patch.object(MMapLineStore, "MATERIALIZE_CHUNK", 2):
+                store = MMapLineStore(path)
+                seen = []
+                for i, line in enumerate(store):
+                    seen.append(line)
+                    if i == 0:
+                        store[2] = "C"     # materializes; iteration must see it
+                self.assertEqual(seen, ["a", "b", "C", "d"])
+
+    def test_mmap_shrunk_file_reads_clamped_lines_without_crashing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "f")
+            with open(path, "w") as fh:
+                fh.write("alpha\nbeta\ngamma\n")
+            store = MMapLineStore(path)
+            try:
+                self.assertFalse(store.shrunk())
+                with open(path, "r+") as fh:
+                    fh.truncate(8)
+                self.assertTrue(store.shrunk())
+                self.assertEqual(list(store), ["alpha", "be", ""])
+                self.assertEqual(store._materialize(), ["alpha", "be", ""])
+                self.assertFalse(store.shrunk())   # no longer mapped
+            finally:
+                store.close()
+
+    def test_mapped_buffer_reloads_when_file_shrinks_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "app.log")
+            with open(path, "w") as fh:
+                fh.writelines(f"original line {i}\n" for i in range(50))
+            editor = self._mapped_editor(path)
+            editor.cursor_row = 40
+            # logrotate copytruncate, then the app logs one more line.
+            with open(path, "r+") as fh:
+                fh.truncate(0)
+            with open(path, "a") as fh:
+                fh.write("after rotate\n")
+
+            editor._reload_if_mapped_file_shrank()
+
+            self.assertEqual(list(editor.lines), ["after rotate"])
+            self.assertEqual(editor.cursor_row, 0)
+            self.assertIn("shrank on disk; reloaded", editor.message)
+            self.assertFalse(editor.modified)
+
+    def test_mapped_buffer_not_reloaded_when_unchanged_grown_or_edited(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "app.log")
+            with open(path, "w") as fh:
+                fh.write("one\ntwo\n")
+            editor = self._mapped_editor(path)
+            store = editor.lines
+            editor._reload_if_mapped_file_shrank()
+            with open(path, "a") as fh:
+                fh.write("three\n")
+            editor._reload_if_mapped_file_shrank()
+            self.assertIs(editor.lines, store)
+            self.assertEqual(list(editor.lines), ["one", "two"])
+
+            # Once edited the buffer holds its own text: never reload over it.
+            editor._insert_text_at_cursor("X")
+            with open(path, "w") as fh:
+                fh.write("")
+            editor._reload_if_mapped_file_shrank()
+            self.assertEqual(list(editor.lines), ["Xone", "two"])
+
+    def test_main_loop_checks_for_shrunk_mapping_before_each_key(self):
+        source = inspect.getsource(ViEditor.edit)
+        read = source.index("key = self._read_key(stdscr)")
+        check = source.index("self._reload_if_mapped_file_shrank()")
+        paste = source.index("self._handle_bracketed_paste(")
+        dispatch = source.index("self._dispatch_key(key, stdscr)")
+        self.assertLess(read, check)
+        self.assertLess(check, paste)
+        self.assertLess(check, dispatch)
+
+    def test_mapped_log_growing_on_disk_does_not_mark_buffer_modified(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "app.log")
+            with open(path, "w") as fh:
+                fh.write("one\ntwo\n")
+            editor = self._mapped_editor(path)
+            editor._append_buffer(os.path.join(tmpdir, "other.txt"), switch=False)
+            with open(path, "a") as fh:
+                fh.write("three\n")
+
+            editor._refresh_all_buffer_modified_flags()
+            self.assertFalse(editor.modified)
+            self.assertFalse(any(b.modified for b in editor.buffers))
+
+            self.assertTrue(editor._execute_cmd(":bd"))
+            self.assertFalse(editor.message_is_error, editor.message)
+
+            # A :w! from the old mapped text would have dropped "three".
+            with open(path) as fh:
+                self.assertEqual(fh.read(), "one\ntwo\nthree\n")
+
+    def test_mapped_buffer_line_ending_change_still_counts_as_modified(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "app.log")
+            with open(path, "w") as fh:
+                fh.write("one\ntwo\n")
+            editor = self._mapped_editor(path)
+            with open(path, "a") as fh:
+                fh.write("three\n")
+            editor.line_endings = ["\r\n", "\r\n"]
+            editor._refresh_modified()
+            self.assertTrue(editor.modified)
+
     def test_quit_blocks_unsaved_changes_in_inactive_buffer(self):
         editor = ViEditor()
         editor.lines = ["changed"]
@@ -2026,14 +2238,14 @@ class ExCommandTests(unittest.TestCase):
         self.assertEqual(editor.default_line_ending, "\n")
         self.assertTrue(editor._execute_cmd(":le-win"))
         self.assertEqual(editor.default_line_ending, "\r\n")
-        self.assertEqual(editor.message, "Default line endings: windows")
+        self.assertEqual(editor.message, "Line endings: windows (written on next :w)")
 
         self.assertTrue(editor._execute_cmd(":set lnendings"))
         self.assertEqual(editor.message, "lnendings=windows")
 
         self.assertTrue(editor._execute_cmd(":le-unix"))
         self.assertEqual(editor.default_line_ending, "\n")
-        self.assertEqual(editor.message, "Default line endings: unix")
+        self.assertEqual(editor.message, "Line endings: unix (written on next :w)")
 
         self.assertTrue(editor._execute_cmd(":set lnendings=win"))
         self.assertEqual(editor.default_line_ending, "\r\n")
@@ -6543,6 +6755,187 @@ class ExCommandTests(unittest.TestCase):
             self.assertIn("No files in selection", editor.message)
             self.assertEqual(len(editor.buffers), buffer_count_before)
 
+    # --- Marks only act where they are visible ------------------------------
+
+    def _fb_two_dirs_with_marks_in_a(self, editor, tmp):
+        """Dirs A (keep1/keep2 marked) and B (junk.txt), panel now in B with
+        the cursor on junk.txt."""
+        a, b = os.path.join(tmp, "A"), os.path.join(tmp, "B")
+        os.makedirs(a)
+        os.makedirs(b)
+        for name in ("keep1.txt", "keep2.txt"):
+            with open(os.path.join(a, name), "w") as fh:
+                fh.write("important")
+        with open(os.path.join(b, "junk.txt"), "w") as fh:
+            fh.write("junk")
+        self._open_fb_at(editor, a, cursor_name="keep1.txt")
+        editor._handle_file_browser(ord(" "))
+        editor._handle_file_browser(ord(" "))
+        panel = editor._active_fb_panel()
+        self.assertEqual(len(panel.selected), 2)
+        editor._fb_enter_dir(b)
+        for i, entry in enumerate(editor._fb_entries(panel)):
+            if entry.name == "junk.txt":
+                panel.cursor = i
+        return a, b, panel
+
+    def test_fb_delete_ignores_marks_made_in_another_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            editor = ViEditor()
+            a, b, panel = self._fb_two_dirs_with_marks_in_a(editor, tmp)
+
+            editor._handle_file_browser(curses.KEY_F8)
+            self.assertEqual(editor.file_browser.op_label, "Delete 'junk.txt'? [y/N] ")
+            editor._handle_file_browser(ord("y"))
+
+            self.assertEqual(sorted(os.listdir(a)), ["keep1.txt", "keep2.txt"])
+            self.assertEqual(os.listdir(b), [])
+            # The marks in A are remembered and act again back in A.
+            self.assertEqual(len(panel.selected), 2)
+            editor._fb_enter_dir(a)
+            self.assertEqual(editor._fb_op_targets(panel),
+                             [os.path.join(a, "keep1.txt"), os.path.join(a, "keep2.txt")])
+
+    def test_fb_copy_and_move_ignore_marks_made_in_another_directory(self):
+        for key, verb in ((curses.KEY_F5, "Copy"), (curses.KEY_F6, "Move/rename")):
+            with self.subTest(verb=verb), tempfile.TemporaryDirectory() as tmp:
+                editor = ViEditor()
+                _a, _b, _panel = self._fb_two_dirs_with_marks_in_a(editor, tmp)
+                editor._handle_file_browser(key)
+                self.assertIn("'junk.txt'", editor.file_browser.op_label)
+                self.assertEqual(editor.file_browser.op_payload["sources"],
+                                 [os.path.join(tmp, "B", "junk.txt")])
+
+    def test_fb_enter_on_directory_ignores_files_marked_elsewhere(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            editor = ViEditor()
+            a, b, panel = self._fb_two_dirs_with_marks_in_a(editor, tmp)
+            os.makedirs(os.path.join(b, "sub"))
+            editor._invalidate_fb_entries(panel)
+            for i, entry in enumerate(editor._fb_entries(panel)):
+                if entry.name == "sub":
+                    panel.cursor = i
+            buffer_count_before = len(editor.buffers)
+
+            editor._handle_file_browser(ord("\n"))
+
+            self.assertEqual(editor.mode, Mode.FILE_BROWSER)
+            self.assertEqual(panel.cwd, os.path.join(b, "sub"))
+            self.assertEqual(len(editor.buffers), buffer_count_before)
+
+    def test_fb_status_line_counts_marks_in_current_directory_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            editor = ViEditor()
+            a, _b, panel = self._fb_two_dirs_with_marks_in_a(editor, tmp)
+            self.assertEqual(editor._fb_marks_here(panel), [])
+            editor._fb_enter_dir(a)
+            self.assertEqual(len(editor._fb_marks_here(panel)), 2)
+
+            class StopDraw(Exception):
+                pass
+
+            status_args = []
+
+            def capture(left, right, width):
+                status_args.append(right)
+                raise StopDraw
+
+            with mock.patch.object(editor, "_format_status", side_effect=capture), \
+                    mock.patch.object(editor, "_add_curses_text"), \
+                    mock.patch.object(editor, "_bar_windows",
+                                      return_value=(mock.MagicMock(), mock.MagicMock())):
+                with self.assertRaises(StopDraw):
+                    editor._draw_file_browser(mock.MagicMock(), 24, 100)
+            self.assertIn("  2 marked  ", status_args[0])
+
+    def test_fb_open_marked_files_keeps_marks_from_other_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            other = os.path.join(tmp, "other")
+            os.makedirs(other)
+            here_file = os.path.join(tmp, "here.txt")
+            there_file = os.path.join(other, "there.txt")
+            for path in (here_file, there_file):
+                with open(path, "w") as fh:
+                    fh.write("x\n")
+            editor = ViEditor()
+            self._open_fb_at(editor, tmp)
+            panel = editor._active_fb_panel()
+            panel.selected.update({here_file, there_file})
+
+            editor._handle_file_browser(ord("\n"))
+
+            self.assertEqual(editor.mode, Mode.NORMAL)
+            self.assertEqual([b.filename for b in editor.buffers[1:]], [here_file])
+            self.assertEqual(panel.selected, {there_file})
+
+    def test_fb_enter_and_right_on_directory_work_with_only_dirs_marked(self):
+        for key in (ord("\n"), ord("l"), curses.KEY_RIGHT, curses.KEY_F4):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as tmp:
+                os.makedirs(os.path.join(tmp, "B"))
+                os.makedirs(os.path.join(tmp, "C", "inner"))
+                editor = ViEditor()
+                self._open_fb_at(editor, tmp, cursor_name="C")
+                editor._handle_file_browser(ord(" "))       # mark C, e.g. to copy it
+                panel = editor._active_fb_panel()
+                for i, entry in enumerate(editor._fb_entries(panel)):
+                    if entry.name == "B":
+                        panel.cursor = i
+
+                editor._handle_file_browser(key)
+
+                self.assertEqual(panel.cwd, os.path.join(tmp, "B"))
+                self.assertFalse(editor.message_is_error, editor.message)
+
+    # --- Overwrite prompt says when a directory tree is replaced -------------
+
+    def test_fb_copy_over_existing_directory_prompt_names_the_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "project", "src"))
+            with open(os.path.join(tmp, "project", "src", "main.c"), "w") as fh:
+                fh.write("code")
+            with open(os.path.join(tmp, "notes.txt"), "w") as fh:
+                fh.write("notes")
+            editor = ViEditor()
+            self._open_fb_at(editor, tmp, cursor_name="notes.txt")
+
+            editor._handle_file_browser(curses.KEY_F5)
+            s = editor.file_browser
+            s.op_text = os.path.join(tmp, "project")
+            s.op_cursor = len(s.op_text)
+            editor._handle_file_browser(ord("\n"))
+
+            self.assertEqual(s.op_kind, "confirm:copy_overwrite")
+            self.assertEqual(s.op_label,
+                             "Replace directory 'project' and everything in it? [y/N] ")
+            editor._handle_file_browser(ord("n"))
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "project", "src", "main.c")))
+
+    def test_fb_overwrite_label_variants(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f1, f2 = os.path.join(tmp, "f1"), os.path.join(tmp, "f2")
+            d1, d2 = os.path.join(tmp, "d1"), os.path.join(tmp, "d2")
+            for path in (f1, f2):
+                with open(path, "w") as fh:
+                    fh.write("x")
+            os.makedirs(d1)
+            os.makedirs(d2)
+            link = os.path.join(tmp, "link")
+            os.symlink(d1, link)
+            editor = ViEditor()
+            self.assertEqual(editor._fb_overwrite_label([f1]),
+                             "Overwrite 1 existing path? [y/N] ")
+            self.assertEqual(editor._fb_overwrite_label([f1, f2]),
+                             "Overwrite 2 existing paths? [y/N] ")
+            # A symlink to a directory is replaced, not its target's tree.
+            self.assertEqual(editor._fb_overwrite_label([link]),
+                             "Overwrite 1 existing path? [y/N] ")
+            self.assertEqual(
+                editor._fb_overwrite_label([f1, d1]),
+                "Overwrite 2 existing paths (1 directory and everything in it deleted)? [y/N] ")
+            self.assertEqual(
+                editor._fb_overwrite_label([d1, d2]),
+                "Overwrite 2 existing paths (2 directories and everything in them deleted)? [y/N] ")
+
     def test_fb_reverse_sort_keeps_dirs_before_files(self):
         # When reverse_sort is True, directories must still appear before files.
         # The pre-fix bug fully reversed the (dir_rank, value) tuple so files
@@ -9680,6 +10073,288 @@ class VisualModeTests(unittest.TestCase):
         self.assertIn("bc", highlighted)
         self.assertIn("hi", highlighted)
 
+    # --- v_p / v_P placement, bracketed paste, and visual J ----------------
+
+    @staticmethod
+    def _visual_editor(lines, cursor=(0, 0), register=None, is_lines=False):
+        editor = _editor_with_rc()
+        editor.lines = list(lines)
+        editor.line_endings = ["\n"] * len(lines)
+        editor.cursor_row, editor.cursor_col = cursor
+        editor._last_h = 24
+        if register is not None:
+            editor.yank_buffer = list(register)
+            editor.yank_is_lines = is_lines
+            editor.yank_line_endings = ["\n"] * len(register) if is_lines else []
+        return editor
+
+    @staticmethod
+    def _feed_any(editor, keys):
+        for key in keys:
+            key = ord(key) if isinstance(key, str) else key
+            if editor.mode in (Mode.VISUAL, Mode.VISUAL_LINE, Mode.VISUAL_BLOCK):
+                editor._handle_visual(key)
+            elif editor.mode == Mode.INSERT:
+                editor._handle_insert(key)
+            else:
+                editor._handle_normal(key, 24, 80)
+        return editor
+
+    def test_visual_put_over_selection_ending_at_eol_lands_at_deletion_point(self):
+        # The delete clamps the VISUAL cursor to len-1; the put must still
+        # go where the selection was, not one character to the left.
+        for keys in ("$vbp", "$vbP"):
+            with self.subTest(keys=keys):
+                editor = self._visual_editor(["abc def"], register=["XYZ"])
+                self._feed_any(editor, keys)
+                self.assertEqual(editor.lines, ["abc XYZ"])
+                self.assertEqual(editor.mode, Mode.NORMAL)
+
+    def test_visual_put_over_multiline_selection_ending_at_eol(self):
+        editor = self._visual_editor(["ab", "cd", "ef"], register=["X"])
+        self._feed_any(editor, "lvj$p")
+        self.assertEqual(editor.lines, ["aX", "ef"])
+        self.assertEqual(editor.yank_buffer, ["b", "cd"])
+
+    def test_visual_put_linewise_register_over_selection_ending_at_eol(self):
+        editor = self._visual_editor(["abc def"], register=["X"], is_lines=True)
+        self._feed_any(editor, "$vbp")
+        self.assertEqual(editor.lines, ["abc ", "X", ""])
+
+    def test_visual_line_put_over_last_line_goes_below_previous_line(self):
+        editor = self._visual_editor(["a", "b", "c"], (2, 0), ["X"], is_lines=True)
+        self._feed_any(editor, "Vp")
+        self.assertEqual(editor.lines, ["a", "b", "X"])
+        self.assertEqual(editor.yank_buffer, ["c"])
+        self.assertEqual((editor.cursor_row, editor.cursor_col), (2, 0))
+
+    def test_visual_line_P_over_trailing_lines_keeps_register(self):
+        editor = self._visual_editor(["a", "b", "c"], (1, 0), ["X"], is_lines=True)
+        self._feed_any(editor, "VjP")
+        self.assertEqual(editor.lines, ["a", "X"])
+        self.assertEqual(editor.yank_buffer, ["X"])
+
+    def test_visual_line_put_over_whole_buffer_leaves_no_stray_line(self):
+        for register, is_lines in ((["X"], True), (["X"], False)):
+            with self.subTest(is_lines=is_lines):
+                editor = self._visual_editor(["a", "b"], register=register, is_lines=is_lines)
+                self._feed_any(editor, "VGp")
+                self.assertEqual(editor.lines, ["X"])
+                self.assertEqual(editor.line_endings, ["\n"])
+                self.assertEqual(editor.yank_buffer, ["a", "b"])
+                self._feed_any(editor, "u")
+                self.assertEqual(editor.lines, ["a", "b"])
+
+    def test_visual_line_put_over_middle_lines_unchanged(self):
+        editor = self._visual_editor(["a", "b", "c"], (1, 0), ["X"], is_lines=True)
+        self._feed_any(editor, "Vp")
+        self.assertEqual(editor.lines, ["a", "X", "c"])
+        editor = self._visual_editor(["a", "b", "c"], (1, 0), ["X"])
+        self._feed_any(editor, "Vp")
+        self.assertEqual(editor.lines, ["a", "X", "c"])
+
+    def test_paste_in_visual_drops_pending_find(self):
+        editor = self._visual_editor(["abcabc"])
+        self._feed_any(editor, "vf")
+        editor._handle_bracketed_paste("Q", None)
+        self.assertEqual(editor.mode, Mode.NORMAL)
+        self.assertEqual(editor._pending_op, "")
+        self._feed_any(editor, "x")   # a real delete, not an f target
+        self.assertEqual(editor.lines[0], "Qbcabc")
+
+    def test_paste_in_visual_block_drops_pending_replace(self):
+        editor = self._visual_editor(["abcd", "efgh"])
+        self._feed_any(editor, ["v", 22, "j", "r"])
+        editor._handle_bracketed_paste("Q", None)
+        self.assertEqual(editor._pending_op, "")
+        self._feed_any(editor, "x")
+        self.assertEqual(editor.lines, ["abcd", "Qfgh"])
+
+    def test_paste_in_visual_drops_armed_register_and_count(self):
+        editor = self._visual_editor(["hello"], register=["u"])
+        editor.registers["a"] = (["AAA"], False)
+        self._feed_any(editor, 'v"a')
+        editor._handle_bracketed_paste("Z", None)
+        self.assertIsNone(editor.active_register)
+        self._feed_any(editor, "p")
+        self.assertNotIn("AAA", editor.lines[0])
+        self.assertIn("u", editor.lines[0])
+
+        editor = self._visual_editor(["abcdefgh"])
+        self._feed_any(editor, "v3")
+        editor._handle_bracketed_paste("Z", None)
+        self.assertEqual(editor._count_str, "")
+        self._feed_any(editor, "x")
+        self.assertEqual(editor.lines, ["Zbcdefgh"])
+
+    def test_paste_in_visual_records_visual_marks(self):
+        editor = self._visual_editor(["abcdef"], (0, 1))
+        editor.visual_marks = True
+        self._feed_any(editor, "vll")
+        editor._handle_bracketed_paste("Z", None)
+        self.assertIn("<", editor.marks)
+        self.assertIn(">", editor.marks)
+
+    def test_paste_in_normal_drops_pending_find(self):
+        editor = self._visual_editor(["abcabc"])
+        self._feed_any(editor, "2f")
+        editor._handle_bracketed_paste("Q", None)
+        self.assertEqual(editor._pending_op, "")
+        self.assertEqual(editor._pending_count, 1)
+
+    def test_visual_join_matches_successive_single_joins(self):
+        lines = ["head", "  one  ", "", "\ttwo", "three", "tail"]
+        endings = ["\n", "\r\n", "\n", "\r\n", "\n", ""]
+
+        def build():
+            editor = self._visual_editor(lines)
+            editor.line_endings = list(endings)
+            editor.marks = {"a": (1, 3), "b": (3, 0), "c": (4, 2), "d": (5, 1)}
+            editor.auto_marks = {1: 2, 2: 5}
+            return editor
+
+        reference = build()
+        for _ in range(4):
+            reference._join_line(0)
+        editor = build()
+        self._feed_any(editor, "V4jJ")
+        self.assertEqual(editor.mode, Mode.NORMAL)
+        self.assertEqual(editor.lines, reference.lines)
+        self.assertEqual(editor.lines, ["head one   two three", "tail"])
+        self.assertEqual(editor.line_endings, reference.line_endings)
+        self.assertEqual(editor.marks, reference.marks)
+        self.assertEqual(editor.auto_marks, reference.auto_marks)
+        self._feed_any(editor, "u")
+        self.assertEqual(editor.lines, lines)
+
+    def test_visual_join_of_large_selection_is_single_pass(self):
+        editor = self._visual_editor([f"line {i}" for i in range(5000)])
+        with mock.patch.object(editor, "_join_line", side_effect=AssertionError):
+            self._feed_any(editor, "VGJ")
+        self.assertEqual(len(editor.lines), 1)
+        self.assertTrue(editor.lines[0].startswith("line 0 line 1 "))
+        self.assertTrue(editor.lines[0].endswith(" line 4999"))
+
+    # --- Block edges inside tabs / wide characters ---------------------------
+
+    def _tab_block(self, lines, cursor, keys):
+        editor = self._visual_editor(lines, cursor)
+        editor.tab_stop = 8
+        return self._feed_any(editor, keys)
+
+    # Anchor on the "e" of row 1 (cell 4), cursor on row 0's "X" (cell 8):
+    # the block is cells 4..8, and row 0's leading tab covers cells 0..7.
+    _PARTIAL_TAB_LINES = ["\tXyz", "abcdefghXyz"]
+    _PARTIAL_TAB_KEYS = ["v", 22, "k", "0", "l"]
+
+    def test_block_delete_keeps_cells_of_a_tab_left_of_the_block(self):
+        editor = self._tab_block(self._PARTIAL_TAB_LINES, (1, 4), self._PARTIAL_TAB_KEYS)
+        self.assertEqual(editor._visual_block_bounds(), (0, 1, 4, 8))
+        self._feed_any(editor, "d")
+        self.assertEqual(editor.lines, ["    yz", "abcdyz"])
+        self.assertEqual(editor.yank_buffer, ["    X", "efghX"])
+        self._feed_any(editor, "u")
+        self.assertEqual(editor.lines, self._PARTIAL_TAB_LINES)
+
+    def test_block_yank_of_partial_tab_is_spaces_and_leaves_buffer(self):
+        editor = self._tab_block(self._PARTIAL_TAB_LINES, (1, 4), self._PARTIAL_TAB_KEYS + ["y"])
+        self.assertEqual(editor.yank_buffer, ["    X", "efghX"])
+        self.assertEqual(editor.lines, self._PARTIAL_TAB_LINES)
+        self.assertFalse(editor.modified)
+
+    def test_block_change_over_partial_tab_stays_aligned(self):
+        editor = self._tab_block(self._PARTIAL_TAB_LINES, (1, 4),
+                                 self._PARTIAL_TAB_KEYS + ["c", "#", 27])
+        self.assertEqual(editor.lines, ["    #yz", "abcd#yz"])
+
+    def test_block_replace_over_partial_tab_fills_only_block_cells(self):
+        editor = self._tab_block(self._PARTIAL_TAB_LINES, (1, 4),
+                                 self._PARTIAL_TAB_KEYS + ["r", "-"])
+        self.assertEqual(editor.lines, ["    -----yz", "abcd-----yz"])
+
+    def test_block_replace_fills_by_screen_cells(self):
+        # A whole tab is 8 cells, so it becomes 8 copies of the char.
+        editor = self._tab_block(["\tXY", "abcdefghXY"], (0, 0), ["v", 22, "j", "7", "l"])
+        self.assertEqual(editor._visual_block_bounds(), (0, 1, 0, 7))
+        self._feed_any(editor, "rz")
+        self.assertEqual(editor.lines, ["zzzzzzzzXY", "zzzzzzzzXY"])
+
+        # Wide characters being replaced keep their width...
+        editor = self._tab_block(["中文ab", "abcdef"], (0, 0), ["v", 22, "j", "l", "l", "l"])
+        self._feed_any(editor, "rx")
+        self.assertEqual(editor.lines, ["xxxxab", "xxxxef"])
+
+        # ...and a wide replacement char fills the same cells, not twice as many.
+        editor = self._tab_block(["abcdXY", "abcdXY"], (0, 0), ["v", 22, "j", "l", "l", "l", "r"])
+        editor._handle_visual("中")
+        self.assertEqual(editor.lines, ["中中XY", "中中XY"])
+        editor = self._tab_block(["abcXY", "abcXY"], (0, 0), ["v", 22, "j", "l", "l", "r"])
+        editor._handle_visual("中")
+        self.assertEqual(editor.lines, ["中 XY", "中 XY"])
+
+    def test_block_delete_straddling_wide_char_keeps_outside_cell(self):
+        editor = self._tab_block(["中中中中", "abcdefgh"], (1, 1), ["v", 22, "k", "d"])
+        self.assertEqual(editor.lines, [" 中中", "aefgh"])
+
+    def test_block_insert_and_append_split_a_tab_at_the_block_column(self):
+        # Row 1's tab straddles both cell 3 (I) and cell 4 (A).
+        lines = ["abcdefghij", "\tZ", "abcdefghij"]
+        editor = self._tab_block(lines, (0, 3), ["v", 22, "j", "j", "I", "#", 27])
+        self.assertEqual(editor.lines, ["abc#defghij", "   #     Z", "abc#defghij"])
+        editor = self._tab_block(lines, (0, 3), ["v", 22, "j", "j", "A", "#", 27])
+        self.assertEqual(editor.lines, ["abcd#efghij", "    #    Z", "abcd#efghij"])
+
+    def test_block_put_into_a_tab_lands_on_the_block_column(self):
+        editor = self._visual_editor(["abcdef", "\tZ"], (0, 3), ["Q", "R"])
+        editor.tab_stop = 8
+        editor.yank_is_block = True
+        self._feed_any(editor, "P")
+        self.assertEqual(editor.lines, ["abcQdef", "   R     Z"])
+
+    def test_block_ops_without_tabs_are_unchanged(self):
+        editor = self._tab_block(["abcdef", "ghijkl"], (0, 1), ["v", 22, "j", "l", "d"])
+        self.assertEqual(editor.lines, ["adef", "gjkl"])
+        self.assertEqual(editor.yank_buffer, ["bc", "hi"])
+
+    def test_charwise_visual_put_of_block_register_puts_a_column(self):
+        lines = ["ab", "cd", "hello world", "xxxx"]
+        editor = self._visual_editor(lines)
+        self._feed_any(editor, ["v", 22, "j", "y"])
+        self.assertEqual(editor.yank_buffer, ["a", "c"])
+        editor.cursor_row, editor.cursor_col = 2, 6
+        self._feed_any(editor, "vep")
+        self.assertEqual(editor.lines, ["ab", "cd", "hello a", "xxxx  c"])
+        self.assertEqual(editor.mode, Mode.NORMAL)
+        self.assertEqual(editor.yank_buffer, ["world"])   # p exchanges
+        self._feed_any(editor, "u")
+        self.assertEqual(editor.lines, lines)
+
+    def test_charwise_visual_P_of_block_register_keeps_register(self):
+        editor = self._visual_editor(["ab", "cd", "hello world", "xxxx"])
+        self._feed_any(editor, ["v", 22, "j", "y"])
+        editor.cursor_row, editor.cursor_col = 2, 6
+        self._feed_any(editor, "veP")
+        self.assertEqual(editor.lines, ["ab", "cd", "hello a", "xxxx  c"])
+        self.assertEqual(editor.yank_buffer, ["a", "c"])
+        self.assertTrue(editor._pending_put_is_block())
+
+    def test_charwise_visual_put_of_empty_block_register_keeps_prefix(self):
+        editor = self._visual_editor(["hello"])
+        editor.block_registers.add("a")
+        editor.registers["a"] = ([""], False)
+        self._feed_any(editor, 'vl"ap')
+        self.assertEqual(editor.mode, Mode.VISUAL)
+        self.assertEqual(editor.active_register, "a")
+        self.assertEqual(editor.lines, ["hello"])
+
+    def test_counted_join_and_visual_join_repeat_still_work(self):
+        editor = self._visual_editor(["a", "b", "c", "d", "e"])
+        self._feed_any(editor, "3J")
+        self.assertEqual(editor.lines, ["a b c", "d", "e"])
+        editor = self._visual_editor(["a", "b", "c", "d", "e", "f"])
+        self._feed_any(editor, "VjJj.")
+        self.assertEqual(editor.lines, ["a b", "c d", "e", "f"])
+
 
 class NormalModeViFeatureTests(unittest.TestCase):
     def send(self, editor: ViEditor, keys):
@@ -9897,7 +10572,7 @@ class NormalModeViFeatureTests(unittest.TestCase):
         self.assertEqual(editor.lines, ["aX"])
         self.assertEqual(editor.cursor_col, 2)
 
-    def test_replace_mode_backspace_after_navigation_is_plain_delete(self):
+    def test_replace_mode_backspace_after_navigation_only_moves(self):
         editor = ViEditor()
         editor.lines = ["abcde"]
         editor.cursor_col = 0
@@ -9907,9 +10582,10 @@ class NormalModeViFeatureTests(unittest.TestCase):
         self.send(editor, [curses.KEY_RIGHT])
         self.send(editor, [curses.KEY_BACKSPACE])
 
-        # Cursor moved away from the just-overtyped column, so backspace
-        # falls back to a normal delete instead of restoring 'X'.
-        self.assertEqual(editor.lines, ["Xcde"])
+        # Nothing this session typed sits before the cursor ('b' is
+        # original text), so backspace moves back without deleting -- as
+        # vim's Replace mode does.
+        self.assertEqual(editor.lines, ["Xbcde"])
         self.assertEqual(editor.cursor_col, 1)
 
     # ------------------------------------------------------------------
@@ -10001,7 +10677,9 @@ class NormalModeViFeatureTests(unittest.TestCase):
         keys = [ord("X"), curses.KEY_BACKSPACE, curses.KEY_BACKSPACE, ord("Y")]
         editor._repeat_insert_change(keys, Mode.REPLACE, None, repeat=3)
 
-        self.assertEqual(editor.lines, ["Yaaaaaaa"])
+        # The extra backspace only moves back over original text, so every
+        # iteration lands its Y on column 0 and nothing is deleted.
+        self.assertEqual(editor.lines, ["Yaaaaaaaaa"])
 
     def test_replace_mode_mid_line_delete_key_shifts_backspace_undo_columns(self):
         # _delete_char_under_insert_cursor's non-EOL branch removes a
@@ -10031,13 +10709,7 @@ class NormalModeViFeatureTests(unittest.TestCase):
 
         self.assertEqual(editor.lines, ["Xcdef"])
 
-    def test_replace_mode_plain_backspace_fallback_shifts_later_undo_columns(self):
-        # Same root cause as above, reached through _backspace()'s plain
-        # (non-restoring) delete branch: navigating away and backspacing
-        # falls back to an ordinary character delete, which must shift
-        # any _replace_overwritten entries recorded further right on the
-        # same row or a later, coincidentally-matching backspace corrupts
-        # the line instead of restoring the right character.
+    def test_replace_mode_backspace_without_entry_moves_and_keeps_later_restores(self):
         editor = ViEditor()
         editor.lines = ["abcdef"]
         editor.cursor_row = 0
@@ -10049,23 +10721,19 @@ class NormalModeViFeatureTests(unittest.TestCase):
         self.send(editor, [ord("Y")])                          # d->Y, col 4
         self.assertEqual(editor.lines, ["XbcYef"])
 
-        self.send(editor, [curses.KEY_LEFT, curses.KEY_LEFT])  # col 2, mismatches top entry
-        self.send(editor, [curses.KEY_BACKSPACE])              # plain fallback delete of 'b'
-        self.assertEqual(editor.lines, ["XcYef"])
+        self.send(editor, [curses.KEY_LEFT, curses.KEY_LEFT])  # col 2, before original 'c'
+        self.send(editor, [curses.KEY_BACKSPACE])              # only moves back over 'b'
+        self.assertEqual(editor.lines, ["XbcYef"])
+        self.assertEqual(editor.cursor_col, 1)
 
-        self.send(editor, [curses.KEY_RIGHT, curses.KEY_RIGHT])  # col 3, matches Y's shifted column
+        self.send(editor, [curses.KEY_RIGHT] * 3)               # col 4, right after Y
         self.send(editor, [curses.KEY_BACKSPACE])
 
-        self.assertEqual(editor.lines, ["Xcdef"])
-
-    def test_replace_mode_backspace_join_keeps_backspace_undo_pointed_at_correct_row(self):
-        # _backspace()'s row-join branch (backspacing at column 0) shifts
-        # self.marks/self.auto_marks for the joined row but, before the
-        # fix, never shifted _replace_overwritten -- so an entry recorded
-        # on the row that gets deleted by the join kept its stale (row,
-        # col), and a later backspace on an unrelated row that happened
-        # to land on that same (row, col) could splice the wrong
-        # character into it.
+        self.assertEqual(editor.lines, ["Xbcdef"])
+    def test_replace_mode_backspace_at_line_start_moves_up_without_joining(self):
+        # The line break above was never typed in this Replace session, so
+        # backspace at column 0 moves to the end of the line above (vim)
+        # instead of joining the lines; restores on either row still work.
         editor = ViEditor()
         editor.lines = ["AA", "BBBB", "CCCC"]
         editor.cursor_row = 1
@@ -10076,27 +10744,14 @@ class NormalModeViFeatureTests(unittest.TestCase):
         self.send(editor, [ord("X")])                          # B->X, col 2
         self.assertEqual(editor.lines[1], "BXBB")
 
-        # Backspace at column 0 joins row1 into row0, shifting row2
-        # ("CCCC") up to index 1.
         self.send(editor, [curses.KEY_HOME])
         self.send(editor, [curses.KEY_BACKSPACE])
-        self.assertEqual(editor.lines, ["AABXBB", "CCCC"])
+        self.assertEqual(editor.lines, ["AA", "BXBB", "CCCC"])
+        self.assertEqual((editor.cursor_row, editor.cursor_col), (0, 2))
 
-        # On the row that shifted into index 1 ("CCCC"), type over col 2,
-        # undo it with one backspace, then backspace once more. That
-        # second backspace must not reach the stale entry describing the
-        # unrelated row-0 edit.
-        self.send(editor, [curses.KEY_DOWN, curses.KEY_HOME,
-                            curses.KEY_RIGHT, curses.KEY_RIGHT])
-        self.send(editor, [ord("Z")])
-        self.assertEqual(editor.lines[1], "CCZC")
+        self.send(editor, [curses.KEY_DOWN])                   # (1, 2), right after X
         self.send(editor, [curses.KEY_BACKSPACE])
-        self.assertEqual(editor.lines[1], "CCCC")
-        self.send(editor, [curses.KEY_BACKSPACE])
-
-        self.assertNotIn("B", editor.lines[1])
-        self.assertEqual(editor.lines[0], "AABXBB")
-
+        self.assertEqual(editor.lines, ["AA", "BBBB", "CCCC"])
     def test_replace_mode_detab_shifts_backspace_undo_columns(self):
         # _detab_before_cursor deletes a same-line character range
         # (Shift-Tab in Replace mode) but, before the fix, never shifted
@@ -12024,7 +12679,8 @@ class NormalModeViFeatureTests(unittest.TestCase):
         editor.lines = ["foo bar baz"]
         editor.cursor_col = 4
         editor._resolve_operator("d", 1, TextObjectMotion(around=True, ch="w"))
-        self.assertEqual(editor.lines, ["foobaz"])
+        # aw takes the trailing space only (vim), not the space on both sides.
+        self.assertEqual(editor.lines, ["foo baz"])
 
     def test_resolve_operator_find_motion(self):
         editor = ViEditor()
@@ -13413,6 +14069,147 @@ class HexModeTests(unittest.TestCase):
             # The binary must never be routed through a decoded text buffer.
             self.assertEqual(len(editor.buffers), buffer_count_before)
 
+    # --- :hex shows the file's real bytes while the buffer matches them -----
+
+    _LATIN1 = "caf\xe9 na\xefve\n".encode("latin-1")
+
+    def _hex_file(self, tmpdir, data=None, name="latin1.txt"):
+        path = os.path.join(tmpdir, name)
+        with open(path, "wb") as fh:
+            fh.write(self._LATIN1 if data is None else data)
+        return path
+
+    def test_hex_command_shows_exact_bytes_of_unmodified_non_utf8_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._hex_file(tmpdir)
+            editor = _editor_with_rc()
+            editor._load_file(path)
+            self.assertNotIsInstance(editor.lines, MMapLineStore)
+
+            editor._execute_cmd(":hex")
+
+            self.assertEqual(editor.mode, Mode.HEX)
+            self.assertEqual(editor._hex_cached_data, self._LATIN1)
+            self.assertEqual(editor._hex_line_count, 1)
+            self.assertNotIn(b"\xef\xbf\xbd", editor._hex_cached_data)
+
+    def test_hex_command_matches_on_either_side_of_mmap_threshold(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._hex_file(tmpdir)
+            small = _editor_with_rc()
+            small._load_file(path)
+            small._execute_cmd(":hex")
+            mapped = _editor_with_rc()
+            mapped.LARGE_FILE_MMAP_THRESHOLD = 1
+            mapped._load_file(path)
+            self.assertTrue(mapped.lines.is_mapped)
+            mapped._execute_cmd(":hex")
+            self.assertEqual(small._hex_cached_data, mapped._hex_cached_data)
+
+    def test_hex_command_shows_buffer_image_once_edited_and_disk_after_undo(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._hex_file(tmpdir)
+            editor = _editor_with_rc()
+            editor._load_file(path)
+            editor._handle_normal(ord("x"), 24, 80)
+            self.assertTrue(editor.modified)
+
+            # Edited: the view is of the buffer, i.e. what :w would write.
+            editor._execute_cmd(":hex")
+            self.assertEqual(editor._hex_cached_data,
+                             "af\ufffd na\ufffdve\n".encode("utf-8"))
+            editor._handle_hex(ord("q"))
+
+            # Back to the loaded text: the file's real bytes again.
+            editor._handle_normal(ord("u"), 24, 80)
+            self.assertFalse(editor.modified)
+            editor._execute_cmd(":hex")
+            self.assertEqual(editor._hex_cached_data, self._LATIN1)
+
+    def test_hex_command_ignores_disk_once_file_changed_after_load(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._hex_file(tmpdir, b"abc\n")
+            editor = _editor_with_rc()
+            editor._load_file(path)
+            with open(path, "wb") as fh:
+                fh.write(b"changed on disk\n")
+            os.utime(path, ns=(1, 1))
+
+            editor._execute_cmd(":hex")
+
+            self.assertEqual(editor._hex_cached_data, b"abc\n")
+
+    def test_hex_command_size_gate_uses_file_size_for_unmodified_buffer(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._hex_file(tmpdir)
+            editor = _editor_with_rc()
+            editor._load_file(path)
+            self.assertEqual(editor._hex_source_size(), len(self._LATIN1))
+            editor.HEX_VIEW_MAX_BYTES = len(self._LATIN1) - 1
+            editor._execute_cmd(":hex")
+            self.assertEqual(editor.mode, Mode.NORMAL)
+            self.assertIn("too large", editor.message)
+
+    def test_hex_command_on_unnamed_buffer_uses_buffer_image(self):
+        editor = _editor_with_rc()
+        editor.lines = ["caf\xe9"]
+        editor.line_endings = ["\n"]
+        editor._execute_cmd(":hex")
+        self.assertEqual(editor._hex_cached_data, "caf\xe9\n".encode("utf-8"))
+
+    # --- F3 hex view is labelled with its file and returns to the browser ---
+
+    def _fb_view_binary(self, tmpdir):
+        notes = os.path.join(tmpdir, "notes.txt")
+        with open(notes, "w") as fh:
+            fh.write("hello\n")
+        blob = self._hex_file(tmpdir, b"\x00\x01ELF" * 8, name="blob.bin")
+        editor = _editor_with_rc()
+        editor._last_h = 24
+        editor._load_file(notes)
+        editor._execute_cmd(":fb")
+        panel = editor._active_fb_panel()
+        panel.cwd = tmpdir
+        editor._invalidate_fb_entries(panel)
+        panel.cursor = [e.name for e in editor._fb_entries(panel)].index("blob.bin")
+        editor._handle_file_browser(curses.KEY_F3)
+        self.assertEqual(editor.mode, Mode.HEX)
+        return editor, notes, blob
+
+    def _hex_status_left(self, editor):
+        captured = {}
+        with mock.patch.object(editor, "_draw_overlay_frame",
+                               side_effect=lambda *a, **k: captured.update(k)):
+            editor._draw_hex(None, 24, 80)
+        return captured["status_left"]
+
+    def test_fb_view_hex_status_names_the_viewed_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            editor, notes, blob = self._fb_view_binary(tmpdir)
+            status = self._hex_status_left(editor)
+            self.assertIn(blob, status)
+            self.assertNotIn(notes, status)
+
+    def test_fb_view_hex_close_returns_to_file_browser(self):
+        for key in (ord("q"), 27):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as tmpdir:
+                editor, _notes, _blob = self._fb_view_binary(tmpdir)
+                editor._handle_hex(key)
+                self.assertEqual(editor.mode, Mode.FILE_BROWSER)
+                self.assertEqual(editor._hex_cached_data, b"")
+
+    def test_hex_command_after_fb_view_labels_buffer_and_returns_to_normal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            editor, notes, _blob = self._fb_view_binary(tmpdir)
+            editor._handle_hex(ord("q"))
+            editor.mode = Mode.NORMAL
+
+            editor._execute_cmd(":hex")
+
+            self.assertIn(notes, self._hex_status_left(editor))
+            editor._handle_hex(ord("q"))
+            self.assertEqual(editor.mode, Mode.NORMAL)
+
 
 class LineEndingsModeTests(unittest.TestCase):
     def test_new_editor_starts_clean_with_line_ending_signature(self):
@@ -13525,10 +14322,33 @@ class LineEndingsModeTests(unittest.TestCase):
             editor.draw(screen)
 
         rendered = [args[2] for args in screen.calls if len(args) >= 3]
-        self.assertTrue(any("one[CRLF]" in text for text in rendered))
-        self.assertTrue(any("two[CR]" in text for text in rendered))
-        self.assertTrue(any("three[NL]" in text for text in rendered))
+        rows = {}
+        for args in screen.calls:
+            if len(args) >= 3:
+                rows[args[0]] = rows.get(args[0], "") + args[2]
+        self.assertIn("one[CRLF]", rows.values())
+        self.assertIn("two[CR]", rows.values())
+        self.assertIn("three[NL]", rows.values())
         self.assertTrue(any("LE" in text for text in rendered))
+
+    def test_draw_line_endings_colors_marker_letters_and_brackets(self):
+        editor = ViEditor()
+        editor.lines = ["one", "two"]
+        editor.line_endings = ["\r\n", ""]
+        editor.le_letter_attr = 1001
+        editor.le_bracket_attr = 2002
+        editor._last_h, editor._last_w = 8, 90
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (8, 90)
+
+        editor._draw_line_endings_row(screen, 0, 0, 90)
+
+        self.assertEqual(screen.addstr.call_args_list, [
+            mock.call(0, 0, "one"),
+            mock.call(0, 3, "[", 2002),
+            mock.call(0, 4, "CRLF", 1001),
+            mock.call(0, 8, "]", 2002),
+        ])
 
     def test_line_endings_follow_linewise_delete(self):
         editor = ViEditor()
@@ -19349,6 +20169,428 @@ class UndoRedoTests(unittest.TestCase):
         self.assertEqual(snapshot.lines, ["ONE", "two"])
 
 
+class InsertModeRegressionTests(unittest.TestCase):
+    def editor(self, lines, cursor=(0, 0), intellisense=False):
+        editor = _editor_with_rc()
+        editor._session_cache = {}
+        editor.lines = list(lines)
+        editor.line_endings = ["\n"] * (len(lines) - 1) + [""]
+        editor.line_endings_trusted = True
+        editor.cursor_row, editor.cursor_col = cursor
+        editor.intellisense = intellisense
+        editor._mark_clean()
+        return editor
+
+    def send(self, editor, keys):
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (24, 80)
+        for key in keys:
+            if isinstance(key, str) and len(key) == 1 and ord(key) < 128:
+                key = ord(key)
+            self.assertTrue(editor._dispatch_key(key, screen))
+
+    def test_paste_preserves_function_key_sequences_and_restores_keypad(self):
+        class DecodingScreen(BracketedPasteTests.FakeScreen):
+            keypad_enabled = True
+
+            def keypad(self, flag):
+                self.keypad_enabled = flag
+
+            def get_wch(self):
+                if self.keypad_enabled and self._keys[:3] == [27, ord("O"), ord("A")]:
+                    del self._keys[:3]
+                    return curses.KEY_UP
+                return super().get_wch()
+
+        payload = "before\x1bOAafter\x1b[201x\t你"
+        screen = DecodingScreen(BracketedPasteTests._paste_keys(payload)[6:])
+        editor = self.editor(["tail"])
+        self.send(editor, ["i"])
+
+        text = editor._read_bracketed_paste_body(screen)
+        self.assertEqual(text, payload)
+        self.assertTrue(screen.keypad_enabled)
+        self.assertTrue(editor._handle_bracketed_paste(text, screen))
+        self.send(editor, [27])
+        self.assertEqual(editor.lines, [payload + "tail"])
+        self.send(editor, ["u"])
+        self.assertEqual(editor.lines, ["tail"])
+        self.send(editor, [18])
+        self.assertEqual(editor.lines, [payload + "tail"])
+
+    def test_paste_read_failure_restores_keypad(self):
+        screen = BracketedPasteTests.FakeScreen([])
+        screen.keypad = mock.Mock()
+        editor = self.editor([""])
+
+        with self.assertRaises(IndexError):
+            editor._read_bracketed_paste_body(screen)
+
+        self.assertEqual(screen.keypad.call_args_list, [mock.call(False), mock.call(True)])
+
+    def test_terminal_paste_preserves_literal_text_and_queued_arrow(self):
+        # Model the terminal's arrow encoding from the actual mode sequences
+        # curses emits, including an arrow queued before paste reading ends.
+        child = '''import curses, json, os, sys
+from test_vi_editor import _editor_with_rc
+
+def run(screen):
+    screen.keypad(True)
+    editor = _editor_with_rc()
+    editor._enter_insert()
+    read_key = editor._read_key
+    ready = False
+
+    def read(window):
+        nonlocal ready
+        if not ready:
+            ready = True
+            os.write(sys.stdout.fileno(), b"PASTE_READY\\n")
+        return read_key(window)
+
+    editor._read_key = read
+    payload = editor._read_bracketed_paste_body(screen)
+    editor._handle_bracketed_paste(payload, screen)
+    key = editor._read_key(screen)
+    editor._dispatch_key(key, screen)
+    with open(sys.argv[1], "w") as fh:
+        json.dump({"payload": payload, "key": key,
+                   "down": curses.KEY_DOWN, "mode": editor.mode.value}, fh)
+
+curses.wrapper(run)
+'''
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_path = os.path.join(tmpdir, "result.json")
+            master, slave = pty.openpty()
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, "-c", child, result_path],
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                    stdin=slave, stdout=slave, stderr=slave,
+                    env=dict(os.environ, TERM="xterm-256color", LINES="24", COLUMNS="80"),
+                )
+            except BaseException:
+                os.close(master)
+                raise
+            finally:
+                os.close(slave)
+            output = b""
+            deadline = time.monotonic() + 10
+            try:
+                while b"PASTE_READY" not in output and time.monotonic() < deadline:
+                    readable, _, _ = select.select([master], [], [], 0.1)
+                    if readable:
+                        try:
+                            output += os.read(master, 8192)
+                        except OSError:
+                            break
+                self.assertIn(b"PASTE_READY", output, repr(output))
+                before_read = output.split(b"PASTE_READY", 1)[0]
+                application = before_read.rfind(b"\x1b[?1h\x1b=")
+                normal = before_read.rfind(b"\x1b[?1l\x1b>")
+                self.assertGreaterEqual(application, 0, repr(output))
+                arrow = b"\x1bOB" if application > normal else b"\x1b[B"
+                payload = "before\x1bOAafter\x1b[201x\t你"
+                os.write(master, payload.encode("utf-8") + b"\x1b[201~" + arrow)
+                while proc.poll() is None and time.monotonic() < deadline:
+                    readable, _, _ = select.select([master], [], [], 0.1)
+                    if readable:
+                        try:
+                            output += os.read(master, 8192)
+                        except OSError:
+                            break
+                self.assertEqual(proc.wait(timeout=2), 0, repr(output))
+                with open(result_path) as fh:
+                    result = json.load(fh)
+                self.assertEqual(result["payload"], payload)
+                self.assertEqual(result["key"], result["down"])
+                self.assertEqual(result["mode"], "INSERT")
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=2)
+                os.close(master)
+
+    def test_paste_application_mode_sequence_handles_partial_writes(self):
+        screen = BracketedPasteTests.FakeScreen([27, *map(ord, "[201~")])
+        screen.keypad = mock.Mock()
+        editor = self.editor([""])
+        emitted = bytearray()
+
+        def write(fd, data):
+            self.assertEqual(fd, 42)
+            count = min(2, len(data))
+            emitted.extend(data[:count])
+            return count
+
+        with mock.patch("vi_editor.curses.tigetstr", return_value=b"\x1b[?1h\x1b="), \
+             mock.patch("vi_editor.sys.stdout") as stdout, \
+             mock.patch("vi_editor.os.write", side_effect=write) as output:
+            stdout.fileno.return_value = 42
+            self.assertEqual(editor._read_bracketed_paste_body(screen), "")
+
+        self.assertEqual(emitted, b"\x1b[?1h\x1b=")
+        self.assertGreater(output.call_count, 1)
+        self.assertEqual(screen.keypad.call_args_list, [mock.call(False), mock.call(True)])
+
+    def test_paste_output_failure_restores_keypad(self):
+        for result in (OSError("terminal output failed"), 0):
+            with self.subTest(result=result):
+                screen = BracketedPasteTests.FakeScreen([])
+                screen.keypad = mock.Mock()
+                editor = self.editor([""])
+                with mock.patch("vi_editor.curses.tigetstr", return_value=b"\x1b="), \
+                     mock.patch("vi_editor.sys.stdout") as stdout, \
+                     mock.patch("vi_editor.os.write", side_effect=[result]):
+                    stdout.fileno.return_value = 42
+                    with self.assertRaises(OSError):
+                        editor._read_bracketed_paste_body(screen)
+                self.assertEqual(screen.keypad.call_args_list, [mock.call(False), mock.call(True)])
+
+    def test_paste_without_keypad_capability_still_reads_literal_text(self):
+        for capability in (None, b"", curses.error("no terminfo")):
+            with self.subTest(capability=capability):
+                screen = BracketedPasteTests.FakeScreen([ord("x"), 27, *map(ord, "[201~")])
+                editor = self.editor([""])
+                with mock.patch("vi_editor.curses.tigetstr", side_effect=[capability]), \
+                     mock.patch("vi_editor.os.write") as output:
+                    self.assertEqual(editor._read_bracketed_paste_body(screen), "x")
+                output.assert_not_called()
+
+    def test_counted_indent_tabs_stay_literal_actions_on_dot_repeat(self):
+        for count in (1, 2, 3):
+            for expand_tab in (False, True):
+                with self.subTest(count=count, expand_tab=expand_tab):
+                    original = ["alpha", "", ""]
+                    editor = self.editor(original, (1, 0), intellisense=True)
+                    editor.expand_tab = expand_tab
+                    expected = (("    " if expand_tab else "\t") + "a") * count
+
+                    self.send(editor, [str(count), "i", 9, "a", 27])
+                    self.assertEqual(editor.lines, ["alpha", expected, ""])
+                    self.assertEqual(len(editor.undo_stack), 1)
+                    self.send(editor, ["u"])
+                    self.assertEqual(editor.lines, original)
+                    self.send(editor, [18])
+                    self.assertEqual(editor.lines, ["alpha", expected, ""])
+
+                    editor._move(2, 0)
+                    self.send(editor, ["."])
+                    self.assertEqual(editor.lines, ["alpha", expected, expected])
+
+    def test_tab_completion_repeats_accepted_text_with_count_and_dot(self):
+        editor = self.editor(["alpha", "", ""], (1, 0), intellisense=True)
+        self.send(editor, ["2", "i", "a", 9, 27])
+        self.assertEqual(editor.lines[1], "alphaalpha")
+        editor._move(2, 0)
+        self.send(editor, ["."])
+        self.assertEqual(editor.lines[2], "alphaalpha")
+
+    def test_counted_replace_backspace_matches_dot_after_undo(self):
+        for count in (2, 3):
+            with self.subTest(count=count):
+                editor = self.editor(["a" * 10])
+                # The second backspace only moves back (vim's Replace mode).
+                expected = ["Y" + "a" * 9]
+                self.send(editor, [str(count), "R", "X", 127, 127, "Y", 27])
+                self.assertEqual(editor.lines, expected)
+                self.assertEqual(len(editor.undo_stack), 1)
+                self.send(editor, ["u"])
+                self.assertEqual(editor.lines, ["a" * 10])
+                self.send(editor, [18])
+                self.assertEqual(editor.lines, expected)
+                self.send(editor, ["u", "."])
+                self.assertEqual(editor.lines, expected)
+
+    def test_insert_and_replace_home_end_reset_vertical_goal(self):
+        for entry in ("i", "R"):
+            for key, expected_col in ((1, 0), (5, 2), (curses.KEY_HOME, 0), (curses.KEY_END, 2)):
+                with self.subTest(entry=entry, key=key):
+                    editor = self.editor(["abcdefghij", "xy", "abcdefghij"], (0, 8))
+                    self.send(editor, [entry, curses.KEY_DOWN, key, curses.KEY_DOWN])
+                    self.assertEqual((editor.cursor_row, editor.cursor_col), (2, expected_col))
+
+    def test_insert_and_replace_edits_reset_vertical_goal(self):
+        for entry in ("i", "R"):
+            for key in ("Z", 127, 9, 10, curses.KEY_DC, curses.KEY_BTAB):
+                with self.subTest(entry=entry, key=key):
+                    middle = "  " if key == curses.KEY_BTAB else "xy"
+                    editor = self.editor(["abcdefghij", middle, "abcdefghij", "abcdefghij"], (0, 8))
+                    self.send(editor, [entry, curses.KEY_DOWN, key])
+                    row, col = editor.cursor_row, editor.cursor_col
+                    self.send(editor, [curses.KEY_DOWN])
+                    self.assertEqual((editor.cursor_row, editor.cursor_col), (row + 1, col))
+
+    def test_paste_resets_vertical_goal_in_insert_and_replace(self):
+        for entry in ("i", "R"):
+            with self.subTest(entry=entry):
+                editor = self.editor(["abcdefghij", "xy", "abcdefghij"], (0, 8))
+                self.send(editor, [entry, curses.KEY_DOWN])
+                editor._handle_bracketed_paste("\nZ", mock.Mock())
+                self.send(editor, [curses.KEY_DOWN])
+                self.assertEqual((editor.cursor_row, editor.cursor_col), (3, 1))
+
+    def test_entering_insert_or_replace_resets_normal_mode_vertical_goal(self):
+        for entry in ("i", "R"):
+            with self.subTest(entry=entry):
+                editor = self.editor(["abcdefghij", "xy", "abcdefghij"], (0, 8))
+                self.send(editor, ["j", entry, curses.KEY_DOWN])
+                self.assertEqual((editor.cursor_row, editor.cursor_col), (2, 2))
+
+    def test_edit_at_same_cursor_position_resets_wrapped_vertical_goal(self):
+        for entry in ("i", "R"):
+            with self.subTest(entry=entry):
+                editor = self.editor(["abcdefghijkl", "ab", "abcdefghij"], (0, 8))
+                editor.filename = "review.md"
+                editor.show_line_numbers = False
+                editor._last_w = 10
+                self.send(editor, [entry, curses.KEY_DOWN])
+                self.assertEqual((editor.cursor_row, editor.cursor_col), (0, 12))
+                self.send(editor, [curses.KEY_DC, curses.KEY_DOWN])
+                self.assertEqual((editor.cursor_row, editor.cursor_col), (1, 2))
+
+    def test_completion_excludes_word_containing_cursor(self):
+        for cursor_col in (1, 2, 4):
+            with self.subTest(cursor_col=cursor_col):
+                editor = self.editor(["alpha"], (0, cursor_col), intellisense=True)
+                self.send(editor, ["i", 14, 25])
+                self.assertEqual(editor._intellisense_completion_matches, [])
+                self.assertEqual(editor.lines, ["alpha"])
+
+    def test_completion_keeps_other_occurrences_of_active_word(self):
+        editor = self.editor(["alpha alpha"], (0, 2), intellisense=True)
+        self.send(editor, ["i", 14])
+        self.assertEqual(editor._intellisense_completion_matches, ["alpha"])
+
+    def test_completion_does_not_reuse_candidates_from_another_word(self):
+        editor = self.editor(["xx al", "alphabet"], (0, 5), intellisense=True)
+        self.send(editor, ["i", 14])
+        self.assertEqual(editor._intellisense_completion_matches, ["alphabet"])
+        self.send(editor, [curses.KEY_DOWN, 25])
+        self.assertEqual(editor._intellisense_completion_matches, [])
+        self.assertEqual(editor.lines, ["xx al", "alphabet"])
+
+    def test_canceled_block_insert_restores_tabs_padding_and_marks(self):
+        for first, start_col, command in (("\tZ", 3, "I"), ("a", 4, "A")):
+            for typed in ([], ["X", 127]):
+                with self.subTest(first=first, command=command, typed=typed):
+                    original = [first, "abcdefghij"]
+                    editor = self.editor(original, (1, start_col))
+                    editor.marks = {"a": (0, 0), "b": (0, len(first) - 1), "c": (1, 7)}
+                    editor.last_jump = (0, len(first) - 1)
+                    editor.auto_marks = {1: 0, 2: 1}
+                    positions = (dict(editor.marks), editor.last_jump, dict(editor.auto_marks))
+
+                    self.send(editor, ["v", 22, "k", command, *typed, 27])
+
+                    self.assertEqual(editor.lines, original)
+                    self.assertEqual((editor.marks, editor.last_jump, editor.auto_marks), positions)
+                    self.assertFalse(editor.modified)
+                    self.assertFalse(editor.undo_stack)
+
+    def test_canceled_block_change_keeps_deletion_and_undo(self):
+        original = ["\tZ", "abcdefghij"]
+        editor = self.editor(original, (1, 3))
+        self.send(editor, ["v", 22, "k", "c"])
+        changed = list(editor.lines)
+        self.assertNotEqual(changed, original)
+        self.send(editor, [27])
+        self.assertEqual(editor.lines, changed)
+        self.assertEqual(len(editor.undo_stack), 1)
+        self.send(editor, ["u"])
+        self.assertEqual(editor.lines, original)
+
+    def test_block_cleanup_after_moving_off_first_row_preserves_cursor_and_edits(self):
+        for first, start_col, command in (("\tZ", 3, "I"), ("a", 4, "A")):
+            for typed in ([], ["Q"]):
+                with self.subTest(first=first, command=command, typed=typed):
+                    original = [first, "abcdefghij"]
+                    editor = self.editor(original, (1, start_col))
+                    editor.marks = {"a": (0, len(first) - 1), "b": (1, 7)}
+                    editor.last_jump = (0, len(first) - 1)
+                    editor.auto_marks = {1: 0, 2: 1}
+                    self.send(editor, ["v", 22, "k", command, curses.KEY_DOWN, *typed])
+                    second_row = editor.lines[1]
+                    resting_col = max(0, editor.cursor_col - 1)
+                    second_row_mark = editor.marks["b"]
+                    self.send(editor, [27])
+
+                    self.assertEqual(editor.lines, [first, second_row])
+                    self.assertEqual((editor.cursor_row, editor.cursor_col), (1, resting_col))
+                    self.assertEqual(editor.marks, {"a": (0, len(first) - 1), "b": second_row_mark})
+                    self.assertEqual(editor.last_jump, (0, len(first) - 1))
+                    self.assertEqual(editor.auto_marks, {1: 0, 2: 1})
+                    if typed:
+                        self.assertEqual(len(editor.undo_stack), 1)
+                        self.send(editor, ["u"])
+                        self.assertEqual(editor.lines, original)
+                        self.send(editor, [18])
+                        self.assertEqual(editor.lines, [first, second_row])
+                    else:
+                        self.assertFalse(editor.modified)
+                        self.assertFalse(editor.undo_stack)
+
+    def test_block_cleanup_keeps_marks_that_moved_off_prepared_row(self):
+        original = ["\tZ", "abcdefghij"]
+        editor = self.editor(original, (1, 3))
+        editor.marks = {"z": (0, 1), "a": (0, 0)}
+        editor.last_jump = (0, 1)
+        self.send(editor, ["v", 22, "k", "I", curses.KEY_END, curses.KEY_LEFT, 10,
+                           curses.KEY_UP, "Z", curses.KEY_DOWN, curses.KEY_END,
+                           curses.KEY_DC, curses.KEY_UP])
+        self.assertEqual(editor.marks["z"], (1, 8))
+        self.assertEqual(editor.last_jump, (1, 8))
+        self.send(editor, [27])
+
+        expected = ["\tZ", "        Zabcdefghij"]
+        self.assertEqual(editor.lines, expected)
+        self.assertEqual(editor.marks, {"z": (1, 8), "a": (0, 0)})
+        self.assertEqual(editor.last_jump, (1, 8))
+        self.assertEqual(len(editor.undo_stack), 1)
+        self.send(editor, ["u"])
+        self.assertEqual(editor.lines, original)
+        self.assertEqual(editor.marks, {"z": (0, 1), "a": (0, 0)})
+        self.assertEqual(editor.last_jump, (0, 1))
+        self.send(editor, [18])
+        self.assertEqual(editor.lines, expected)
+        self.assertEqual(editor.marks["z"], (1, 8))
+        self.assertEqual(editor.last_jump, (1, 8))
+
+    def test_block_cleanup_does_not_restore_preparation_into_a_new_row(self):
+        original = ["\tZ", "abcdefghij"]
+        editor = self.editor(original, (1, 3))
+        editor.marks = {"z": (0, 1)}
+        self.send(editor, ["v", 22, "k", "I", curses.KEY_HOME, 10])
+        changed = list(editor.lines)
+        marks = dict(editor.marks)
+        self.send(editor, [27])
+        self.assertEqual(editor.lines, changed)
+        self.assertEqual(editor.marks, marks)
+        self.assertEqual(len(editor.lines), 3)
+        self.send(editor, ["u"])
+        self.assertEqual(editor.lines, original)
+
+    def test_block_insert_does_not_replicate_after_moving_off_first_row(self):
+        editor = self.editor(["\tZ", "abcdefghij"], (1, 3))
+        self.send(editor, ["v", 22, "k", "I", "Q", curses.KEY_DOWN, 27])
+        self.assertEqual(editor.lines, ["   Q     Z", "abcdefghij"])
+        self.assertEqual(editor.cursor_row, 1)
+
+    def test_block_cancellation_off_first_row_preserves_redo(self):
+        original = ["\tZ", "abcdefghij"]
+        editor = self.editor(original)
+        self.send(editor, ["A", "x", 27, "u"])
+        self.assertEqual(len(editor.redo_stack), 1)
+        editor._move(1, 3)
+        self.send(editor, ["v", 22, "k", "I", curses.KEY_DOWN, 27])
+        self.assertEqual(editor.lines, original)
+        self.assertFalse(editor.modified)
+        self.assertFalse(editor.undo_stack)
+        self.assertEqual(len(editor.redo_stack), 1)
+        self.send(editor, [18])
+        self.assertEqual(editor.lines, ["\tZx", "abcdefghij"])
+
+
 class FunctionalReviewRegressionTests(unittest.TestCase):
     def editor(self, lines=None):
         editor = _editor_with_rc()
@@ -20134,6 +21376,778 @@ class MarkdownWrapTests(unittest.TestCase):
         editor._switch_buffer(0)
         self.assertEqual(self.draw(editor, screen), (3, 5))
         self.assertEqual(editor._top_wrap, original_top)
+
+
+class LineEndingsViewTests(unittest.TestCase):
+    def editor(self, lines, endings):
+        editor = _editor_with_rc()
+        editor.lines = list(lines)
+        editor.line_endings = list(endings)
+        editor.line_endings_trusted = True
+        return editor
+
+    def draw(self, editor, width=40, height=10):
+        """Render the view; returns (status_left, {row: drawn text})."""
+        editor._last_h, editor._last_w = height, width
+        drawn = {}
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (height, width)
+        screen.addstr.side_effect = lambda r, c, text, *a: drawn.__setitem__(
+            r, drawn.get(r, "") + text)
+        captured = {}
+
+        def frame(stdscr, h, w, **kw):
+            captured.update(kw)
+            for idx in range(kw["total"]):
+                kw["draw_row"](screen, idx, idx)
+
+        editor._open_line_endings_view()
+        with mock.patch.object(editor, "_draw_overlay_frame", side_effect=frame):
+            editor._draw_line_endings(screen, height, width)
+        return captured["status_left"], drawn
+
+    def test_marker_stays_visible_on_lines_wider_than_screen(self):
+        editor = self.editor(
+            ["short", "x" * 60, "\t" * 6 + "tabbed", "日本語" * 20],
+            ["\r\n", "\n", "\r\n", ""],
+        )
+        _, drawn = self.draw(editor, width=40)
+        self.assertEqual(drawn[0], "short[CRLF]")
+        for row, marker in ((1, "[NL]"), (2, "[CRLF]"), (3, "[NONE]")):
+            with self.subTest(row=row):
+                self.assertTrue(drawn[row].endswith("…" + marker), drawn[row])
+                self.assertLess(editor._display_width(drawn[row]), 40)
+
+    def test_line_that_just_fits_is_not_cut(self):
+        editor = self.editor(["y" * 33], ["\n"])
+        text = editor._line_endings_view_line(0, 40)
+        self.assertEqual(text, "y" * 33 + "[NL]")
+        self.assertEqual(editor._line_endings_view_line(0, 37), "y" * 31 + "…[NL]")
+
+    def test_full_text_without_width_is_unchanged(self):
+        editor = self.editor(["x" * 60, "b"], ["\r\n", ""])
+        self.assertEqual(editor._line_endings_view_lines(),
+                         ["x" * 60 + "[CRLF]", "b[NONE]"])
+
+    def test_status_says_when_next_save_converts_endings(self):
+        editor = self.editor(["a", "b", "c"], ["\n", "\r\n", ""])
+        status, _ = self.draw(editor)
+        self.assertIn("→ unix on :w", status)
+
+        editor = self.editor(["a", "b"], ["\r\n", "\r\n"])
+        editor.default_line_ending = "\r\n"
+        status, _ = self.draw(editor)
+        self.assertNotIn("on :w", status)
+
+    def test_save_note_clears_once_the_file_is_normalized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mixed.txt")
+            with open(path, "wb") as fh:
+                fh.write(b"a\nb\r\nc\n")
+            editor = _editor_with_rc()
+            editor._session_cache = {}
+            editor.buffers = []
+            editor._append_buffer(path, switch=True)
+            self.assertIn("on :w", self.draw(editor)[0])
+            editor.mode = Mode.NORMAL
+            editor.lines[0] = "A"
+            editor.modified = True
+            self.assertTrue(editor._save_file())
+            self.assertIn("[endings → unix]", editor.message)
+            self.assertNotIn("on :w", self.draw(editor)[0])
+
+
+class InsertReplaceVimBehaviorTests(unittest.TestCase):
+    def editor(self, lines, cursor=(0, 0)):
+        editor = _editor_with_rc()
+        editor._session_cache = {}
+        editor.lines = list(lines)
+        editor.line_endings = ["\n"] * (len(lines) - 1) + [""]
+        editor.line_endings_trusted = True
+        editor.cursor_row, editor.cursor_col = cursor
+        editor._mark_clean()
+        return editor
+
+    def send(self, editor, *keys):
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (24, 80)
+        for key in keys:
+            for k in (map(ord, key) if isinstance(key, str) else (key,)):
+                editor._dispatch_key(k, screen)
+
+    # --- Replace-mode backspace never deletes original text ---------------
+
+    def test_replace_backspace_past_replacement_start_only_moves(self):
+        editor = self.editor(["abcd"], (0, 1))
+        self.send(editor, "RXY", 127, 127, 127, 127)
+        self.assertEqual(editor.lines, ["abcd"])
+        self.assertEqual(editor.cursor_col, 0)
+        self.send(editor, 27)
+        self.assertFalse(editor.undo_stack)
+        self.assertFalse(editor.modified)
+
+    def test_replace_backspace_at_line_start_moves_up_without_joining(self):
+        editor = self.editor(["ab", "cd"], (1, 0))
+        self.send(editor, "R", 127)
+        self.assertEqual(editor.lines, ["ab", "cd"])
+        self.assertEqual((editor.cursor_row, editor.cursor_col), (0, 2))
+
+    def test_replace_backspace_rejoins_line_break_it_typed(self):
+        editor = self.editor(["    abcd", "next"], (0, 6))
+        editor.line_endings = ["\r\n", ""]
+        self.send(editor, "R", 10)
+        self.assertEqual(editor.lines, ["    ab", "    cd", "next"])
+        self.send(editor, 127)
+        self.assertEqual(editor.lines, ["    abcd", "next"])
+        self.assertEqual(editor.line_endings, ["\r\n", ""])
+        self.assertEqual((editor.cursor_row, editor.cursor_col), (0, 6))
+
+    def test_replace_backspace_removes_tab_indent_and_appended_text(self):
+        editor = self.editor(["ab"], (0, 1))
+        self.send(editor, "R", 9, "XYZ")
+        self.assertEqual(editor.lines, ["a    XYZ"])
+        self.send(editor, *[127] * 8)
+        self.assertEqual(editor.lines, ["ab"])
+        self.assertEqual(editor.cursor_col, 0)
+
+    def test_replace_backspace_unwinds_pasted_lines(self):
+        editor = self.editor(["abcd"])
+        self.send(editor, "R")
+        editor._handle_bracketed_paste("x\ny", mock.Mock())
+        self.assertEqual(editor.lines, ["x", "ycd"])
+        self.send(editor, 127, 127, 127)
+        self.assertEqual(editor.lines, ["abcd"])
+
+    # --- o / O copy indent; unused autoindent is dropped -------------------
+
+    def test_o_and_O_copy_current_line_indent(self):
+        for keys, want in ((["oX"], ["\tfoo", "\tX"]), (["OX"], ["\tX", "\tfoo"])):
+            with self.subTest(keys=keys):
+                editor = self.editor(["\tfoo"])
+                self.send(editor, *keys, 27)
+                self.assertEqual(editor.lines, want)
+
+    def test_counted_and_repeated_o_keep_indent(self):
+        editor = self.editor(["  a", "b"])
+        self.send(editor, "3oX", 27)
+        self.assertEqual(editor.lines, ["  a", "  X", "  X", "  X", "b"])
+        self.send(editor, ".")
+        self.assertEqual(editor.lines[4:7], ["  X", "  X", "  X"])
+
+    def test_unused_autoindent_is_dropped_on_esc(self):
+        for keys in (["o"], ["O"], ["A", 10]):
+            with self.subTest(keys=keys):
+                editor = self.editor(["    foo"])
+                self.send(editor, *keys, 27)
+                self.assertIn("", editor.lines)
+                self.assertNotIn("    ", editor.lines)
+                self.assertEqual(editor.cursor_col, 0)
+
+    def test_unused_autoindent_is_dropped_on_enter_and_carried_on(self):
+        editor = self.editor(["    foo"])
+        self.send(editor, "A", 10, 10, "x", 27)
+        self.assertEqual(editor.lines, ["    foo", "", "    x"])
+        editor = self.editor(["    foo"])
+        self.send(editor, "o", 10, 10, "y", 27)
+        self.assertEqual(editor.lines, ["    foo", "", "", "    y"])
+
+    def test_used_or_mid_line_indent_is_kept(self):
+        editor = self.editor(["    foo bar"], (0, 8))
+        self.send(editor, "i", 10, 27)
+        self.assertEqual(editor.lines, ["    foo ", "    bar"])
+        editor = self.editor(["    foo"])
+        self.send(editor, "oz", 127, 27)
+        self.assertEqual(editor.lines, ["    foo", "    "])
+
+    # --- a file keeps its own line endings ----------------------------------
+
+    def _save_after(self, content, *keys, option=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "f.txt")
+            with open(path, "wb") as fh:
+                fh.write(content)
+            editor = _editor_with_rc()
+            editor._session_cache = {}
+            if option:
+                editor._set_default_line_endings(option)
+            editor.buffers = []
+            editor._append_buffer(path, switch=True)
+            self.send(editor, *keys)
+            self.assertTrue(editor._save_file())
+            with open(path, "rb") as fh:
+                return fh.read(), editor
+
+    def test_crlf_file_stays_crlf_through_edits(self):
+        cases = [
+            (["x"], b"b\r\ncd\r\n"),
+            (["A", 10, "X", 27], b"ab\r\nX\r\ncd\r\n"),
+            (["oX", 27], b"ab\r\nX\r\ncd\r\n"),
+            (["jA", 10, "X", 27], b"ab\r\ncd\r\nX\r\n"),
+        ]
+        for keys, want in cases:
+            with self.subTest(keys=keys):
+                data, editor = self._save_after(b"ab\r\ncd\r\n", *keys)
+                self.assertEqual(data, want)
+                self.assertNotIn("endings", editor.message)
+
+    def test_lf_file_stays_lf_when_option_is_windows(self):
+        data, editor = self._save_after(b"ab\ncd", "x", option="win")
+        self.assertEqual(data, b"b\ncd\n")
+        self.assertEqual(editor.lnendings_option, "\r\n")
+
+    def test_mixed_file_is_normalized_to_option_with_warning(self):
+        data, editor = self._save_after(b"a\nb\r\nc\n", "x")
+        self.assertEqual(data, b"\nb\nc\n")
+        self.assertIn("[endings → unix]", editor.message)
+
+    def test_large_mmap_crlf_file_keeps_crlf(self):
+        with mock.patch.object(ViEditor, "LARGE_FILE_MMAP_THRESHOLD", 1):
+            data, _ = self._save_after(b"ab\r\ncd\r\n", "x")
+        self.assertEqual(data, b"b\r\ncd\r\n")
+
+    def test_le_command_converts_current_file_and_sets_option(self):
+        data, editor = self._save_after(b"ab\r\ncd\r\n", "x", ":le-unix", 10)
+        self.assertEqual(data, b"b\ncd\n")
+        self.send(editor, ":set lnendings", 10)
+        self.assertEqual(editor.message, "lnendings=unix")
+
+    def test_set_lnendings_reports_option_not_buffer(self):
+        _, editor = self._save_after(b"ab\r\ncd\r\n", "x")
+        self.assertEqual(editor.default_line_ending, "\r\n")
+        self.send(editor, ":set lnendings", 10)
+        self.assertEqual(editor.message, "lnendings=unix")
+
+    def test_each_buffer_keeps_its_own_ending_across_switches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dos = os.path.join(tmp, "dos.txt")
+            unix = os.path.join(tmp, "unix.txt")
+            with open(dos, "wb") as fh:
+                fh.write(b"a\r\n")
+            with open(unix, "wb") as fh:
+                fh.write(b"a\n")
+            editor = _editor_with_rc()
+            editor._session_cache = {}
+            editor.buffers = []
+            editor._append_buffer(dos, switch=True)
+            editor._append_buffer(unix, switch=True)
+            self.send(editor, "oB", 27)
+            self.assertTrue(editor._save_file())
+            editor._switch_buffer(0)
+            self.assertEqual(editor.filename, dos)
+            self.assertEqual(editor.default_line_ending, "\r\n")
+            self.send(editor, "oB", 27)
+            self.assertTrue(editor._save_file())
+            editor._switch_buffer(1)
+            self.assertEqual(editor.default_line_ending, "\n")
+            self.assertTrue(editor._save_file())
+            with open(dos, "rb") as fh:
+                self.assertEqual(fh.read(), b"a\r\nB\r\n")
+            with open(unix, "rb") as fh:
+                self.assertEqual(fh.read(), b"a\nB\n")
+
+    def test_new_buffer_uses_lnendings_option(self):
+        editor = _editor_with_rc()
+        editor._set_default_line_endings("win")
+        editor._execute_cmd("enew!")
+        self.assertEqual(editor.default_line_ending, "\r\n")
+
+
+class IntellisenseScanTests(unittest.TestCase):
+    def editor(self, lines, row):
+        editor = _editor_with_rc()
+        editor._session_cache = {}
+        editor.lines = list(lines)
+        editor.line_endings = ["\n"] * (len(lines) - 1) + [""]
+        editor.cursor_row, editor.cursor_col = row, 0
+        editor.intellisense = True
+        return editor
+
+    def type(self, editor, text):
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (24, 80)
+        for ch in text:
+            editor._dispatch_key(ord(ch), screen)
+
+    def test_scan_rows_go_outward_from_cursor_within_bound(self):
+        editor = self.editor([str(i) for i in range(6)], 2)
+        with mock.patch.object(editor, "MAX_INTELLISENSE_SCAN_LINES", 4):
+            self.assertEqual(list(editor._intellisense_scan_rows()), [2, 1, 3, 0])
+        for row in (0, 2, 5):
+            with self.subTest(row=row):
+                editor.cursor_row = row
+                rows = list(editor._intellisense_scan_rows())
+                self.assertEqual(rows[0], row)
+                self.assertEqual(sorted(rows), list(range(6)))
+
+    def test_word_near_cursor_past_scan_bound_from_top_is_offered(self):
+        lines = [f"line {i}" for i in range(60)]
+        lines[45] = "zebra_handler = make()"
+        editor = self.editor(lines, 46)
+        with mock.patch.object(editor, "MAX_INTELLISENSE_SCAN_LINES", 10):
+            self.type(editor, "Ozeb")
+            self.assertEqual(editor._intellisense_completion_matches, ["zebra_handler"])
+            self.assertFalse(editor._intellisense_completion_complete)
+            self.type(editor, "\t")
+        self.assertEqual(editor.lines[46], "zebra_handler")
+
+    def test_nearest_words_win_the_match_cap(self):
+        lines = [f"alpha_far_{i}" for i in range(30)] + ["", "alpha_near"]
+        editor = self.editor(lines, 30)
+        with mock.patch.object(editor, "MAX_INTELLISENSE_MATCHES", 3):
+            self.type(editor, "ial")
+        self.assertIn("alpha_near", editor._intellisense_completion_matches)
+
+    def test_buffer_within_bound_is_still_exhaustive(self):
+        editor = self.editor(["alpha", "beta", ""], 2)
+        self.type(editor, "ial")
+        self.assertEqual(editor._intellisense_completion_matches, ["alpha"])
+        self.assertTrue(editor._intellisense_completion_complete)
+
+    def test_repeat_scan_of_large_buffer_hits_word_cache(self):
+        lines = [f"value_{i} = compute(item_{i})" for i in range(6000)]
+        editor = self.editor(lines, 3000)
+        real = editor._RE_INTELLISENSE_WORD
+        calls = []
+
+        class Counting:
+            def finditer(self, text):
+                calls.append(text)
+                return real.finditer(text)
+
+        with mock.patch.object(editor, "_RE_INTELLISENSE_WORD", Counting()):
+            self.type(editor, "Oq")
+            self.assertGreaterEqual(len(calls), 6000)
+            calls.clear()
+            editor._clear_intellisense_completion()
+            editor._refresh_intellisense_completion()
+        # Only the cursor row (which bypasses the cache) is re-scanned.
+        self.assertLessEqual(len(calls), 1)
+
+    def test_word_cache_is_bounded_by_characters_and_keeps_recent_lines(self):
+        editor = self.editor(["x"], 0)
+        with mock.patch.object(editor, "INTELLISENSE_WORD_CACHE_CHARS", 30):
+            for i in range(10):
+                editor._line_completion_words(f"line_{i:04d}")    # 9 chars each
+                editor._line_completion_words("keep_me")           # re-used: stays
+            cache = editor._intellisense_line_words
+            self.assertIn("keep_me", cache)
+            self.assertLessEqual(sum(map(len, cache)), 30)
+            self.assertEqual(editor._intellisense_cache_chars, sum(map(len, cache)))
+
+
+class VisualModeCommandTests(unittest.TestCase):
+    def editor(self, lines, cursor=(0, 0)):
+        editor = _editor_with_rc()
+        editor._session_cache = {}
+        editor.lines = list(lines)
+        editor.line_endings = ["\n"] * (len(lines) - 1) + [""]
+        editor.line_endings_trusted = True
+        editor.cursor_row, editor.cursor_col = cursor
+        editor._mark_clean()
+        return editor
+
+    def send(self, editor, *keys):
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (24, 80)
+        for key in keys:
+            for k in (map(ord, key) if isinstance(key, str) else (key,)):
+                editor._dispatch_key(k, screen)
+
+    def test_r_replaces_selection_in_every_visual_mode(self):
+        cases = [
+            (["abcdef"], (0, 0), ["vllrx"], ["xxxdef"]),
+            (["a\tb", "z"], (0, 0), ["vllrx"], ["xxx", "z"]),
+            (["abcd", "efgh"], (0, 1), ["vjrx"], ["axxx", "xxgh"]),
+            (["abc", "def"], (0, 0), ["Vrx"], ["xxx", "def"]),
+            (["abcd", "abcd"], (0, 1), ["v", 22, "jlrx"], ["axxd", "axxd"]),
+        ]
+        for lines, cursor, keys, want in cases:
+            with self.subTest(keys=keys, lines=lines):
+                editor = self.editor(lines, cursor)
+                self.send(editor, *keys)
+                self.assertEqual(editor.lines, want)
+                self.assertEqual(editor.mode, Mode.NORMAL)
+                self.assertEqual(len(editor.undo_stack), 1)
+                self.send(editor, "u")
+                self.assertEqual(editor.lines, lines)
+
+    def test_r_dot_repeats_over_same_shaped_region(self):
+        editor = self.editor(["abcdef", "ghijkl"])
+        self.send(editor, "vllrx", "j0.")
+        self.assertEqual(editor.lines, ["xxxdef", "xxxjkl"])
+
+        editor = self.editor(["abc", "def", "ghi", "jkl", "mno"], (0, 1))
+        self.send(editor, "vjrx", "jj0.")
+        self.assertEqual(editor.lines, ["axx", "xxf", "ghi", "xxx", "xxo"])
+
+        editor = self.editor(["ab", "cd", "ef"])
+        self.send(editor, "Vrx", "jj.")
+        self.assertEqual(editor.lines, ["xx", "cd", "xx"])
+
+    def test_r_cancelled_or_without_a_character_changes_nothing(self):
+        for key in (27, curses.KEY_LEFT):
+            with self.subTest(key=key):
+                editor = self.editor(["abc"])
+                self.send(editor, "vlr", key)
+                self.assertEqual(editor.lines, ["abc"])
+                self.assertFalse(editor.undo_stack)
+        editor = self.editor(["abc"])
+        self.send(editor, "vlr", curses.KEY_LEFT)
+        self.assertIn("Unknown command: r", editor.message)
+
+    def test_u_and_U_change_case_in_every_visual_mode(self):
+        cases = [
+            (["ABCDEF"], (0, 0), ["vllu"], ["abcDEF"]),
+            (["abcdef"], (0, 0), ["vllU"], ["ABCdef"]),
+            (["aBc", "DeF", "gh"], (0, 0), ["VjU"], ["ABC", "DEF", "gh"]),
+            (["ABCD", "ABCD"], (0, 1), ["v", 22, "jlu"], ["AbcD", "AbcD"]),
+            (["abcd", "abcd"], (0, 1), ["v", 22, "jlU"], ["aBCd", "aBCd"]),
+        ]
+        for lines, cursor, keys, want in cases:
+            with self.subTest(keys=keys, lines=lines):
+                editor = self.editor(lines, cursor)
+                self.send(editor, *keys)
+                self.assertEqual(editor.lines, want)
+                self.assertEqual(editor.mode, Mode.NORMAL)
+
+    def test_u_and_U_dot_repeat_their_own_case_change(self):
+        editor = self.editor(["ABCDEF", "GHIJKL"])
+        self.send(editor, "vlu", "j0.")
+        self.assertEqual(editor.lines, ["abCDEF", "ghIJKL"])
+        editor = self.editor(["abc", "def", "ghi", "jkl"])
+        self.send(editor, "VjU", "j.")
+        self.assertEqual(editor.lines, ["ABC", "DEF", "GHI", "JKL"])
+
+    def test_case_change_without_effect_is_not_an_edit(self):
+        editor = self.editor(["abc"])
+        self.send(editor, "vllu")
+        self.assertEqual(editor.lines, ["abc"])
+        self.assertFalse(editor.undo_stack)
+        self.assertFalse(editor.modified)
+
+    def test_iw_and_aw_select_the_word(self):
+        editor = self.editor(["foo bar baz"], (0, 5))
+        self.send(editor, "viw")
+        self.assertEqual(editor.mode, Mode.VISUAL)
+        self.assertEqual((editor.visual_start, (editor.cursor_row, editor.cursor_col)),
+                         ((0, 4), (0, 6)))
+        self.send(editor, "d")
+        self.assertEqual(editor.lines, ["foo  baz"])
+
+        for col in (4, 5, 6):
+            with self.subTest(col=col):
+                editor = self.editor(["foo bar baz"], (0, col))
+                self.send(editor, "vawd")
+                self.assertEqual(editor.lines, ["foo baz"])
+
+    def test_iw_from_linewise_selection_becomes_charwise(self):
+        editor = self.editor(["foo bar", "baz"], (0, 5))
+        self.send(editor, "Viw")
+        self.assertEqual(editor.mode, Mode.VISUAL)
+        self.send(editor, "y")
+        self.assertEqual(editor.yank_buffer, ["bar"])
+        self.assertFalse(editor.yank_is_lines)
+
+    def test_viwp_replaces_only_the_word(self):
+        editor = self.editor(["foo bar", "baz qux"])
+        self.send(editor, "yiw", "w", "viwp")
+        self.assertEqual(editor.lines, ["foo foo", "baz qux"])
+
+    def test_unknown_text_object_reports_and_keeps_selection(self):
+        editor = self.editor(["foo bar", "baz"])
+        self.send(editor, "vlix")
+        self.assertIn("Unknown command: ix", editor.message)
+        self.assertEqual(editor.mode, Mode.VISUAL)
+        self.assertEqual(editor.lines, ["foo bar", "baz"])
+
+    def test_unknown_printable_key_is_reported_not_swallowed(self):
+        editor = self.editor(["abc"])
+        self.send(editor, "vlQ")
+        self.assertEqual(editor.message, "Unknown command: Q")
+        self.assertTrue(editor.message_is_error)
+        self.assertEqual(editor.mode, Mode.VISUAL)
+        self.assertEqual(editor.lines, ["abc"])
+
+        editor = self.editor(["abc"])
+        self.send(editor, "vl", curses.KEY_F5)
+        self.assertEqual(editor.message, "")
+
+    def test_visual_marks_stay_inside_buffer_after_operation(self):
+        cases = [
+            (["a", "b", "c", "dd", "ee"], (3, 0), "Vjd"),
+            (["a", "b", "c"], (1, 0), "VjJ"),
+            (["abcdef"], (0, 2), "v$d"),
+        ]
+        for lines, cursor, keys in cases:
+            with self.subTest(keys=keys):
+                editor = self.editor(lines, cursor)
+                editor.visual_marks = True
+                self.send(editor, keys)
+                last = len(editor.lines) - 1
+                for name in "<>":
+                    row, col = editor.marks[name]
+                    self.assertLessEqual(row, last)
+                    self.assertLessEqual(col, len(editor.lines[row]))
+                editor._move(0, 0)
+                self.send(editor, "`>")
+                self.assertEqual(editor.cursor_row, editor.marks[">"][0])
+
+    def test_daw_at_word_start_takes_trailing_space_only(self):
+        for lines, col, want in ((["foo bar baz"], 4, ["foo baz"]),
+                                 (["foo bar"], 4, ["foo"])):
+            with self.subTest(lines=lines, col=col):
+                editor = self.editor(lines, (0, col))
+                self.send(editor, "daw")
+                self.assertEqual(editor.lines, want)
+
+
+class FileBrowserPathTests(unittest.TestCase):
+    @staticmethod
+    def write(path, text="x\n"):
+        with open(path, "w") as fh:
+            fh.write(text)
+        return path
+
+    def browser(self, left, right):
+        editor = ViEditor()
+        editor._execute_cmd(":fb")
+        editor.file_browser.left.cwd = left
+        editor.file_browser.right.cwd = right
+        editor.file_browser.active_panel = 0
+        editor._open_file_browser()
+        return editor
+
+    def select(self, editor, name):
+        panel = editor._active_fb_panel()
+        names = [entry.name for entry in editor._fb_entries(panel)]
+        panel.cursor = names.index(name)
+
+    def test_f5_default_into_symlinked_directory_copies_into_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            real = os.path.join(tmp, "real")
+            os.mkdir(src)
+            os.mkdir(real)
+            self.write(os.path.join(src, "a.txt"), "A\n")
+            link = os.path.join(tmp, "dl")
+            os.symlink(real, link)
+            editor = self.browser(src, tmp)
+            # Browsing into the link keeps it in the panel path.
+            editor.file_browser.active_panel = 1
+            editor._fb_enter_dir(link)
+            editor.file_browser.active_panel = 0
+            self.select(editor, "a.txt")
+
+            editor._handle_file_browser(curses.KEY_F5)
+            self.assertEqual(editor.file_browser.op_text, link + os.sep)
+            editor._handle_file_browser(10)
+
+            self.assertFalse(editor.file_browser.op_prompt)
+            self.assertFalse(editor.message_is_error, editor.message)
+            self.assertTrue(os.path.islink(link))
+            with open(os.path.join(real, "a.txt")) as fh:
+                self.assertEqual(fh.read(), "A\n")
+
+    def test_multi_copy_and_move_into_symlinked_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            real = os.path.join(tmp, "real")
+            os.mkdir(src)
+            os.mkdir(real)
+            paths = [self.write(os.path.join(src, n)) for n in ("a", "b")]
+            link = os.path.join(tmp, "dl")
+            os.symlink(real, link)
+            editor = self.browser(src, link)
+
+            editor._fb_perform_copy(paths, link)
+            self.assertFalse(editor.message_is_error, editor.message)
+            self.assertEqual(sorted(os.listdir(real)), ["a", "b"])
+
+            for name in ("a", "b"):
+                os.remove(os.path.join(real, name))
+            editor._fb_perform_move(paths, link)
+            self.assertFalse(editor.message_is_error, editor.message)
+            self.assertEqual(sorted(os.listdir(real)), ["a", "b"])
+            self.assertEqual(os.listdir(src), [])
+            self.assertTrue(os.path.islink(link))
+
+    def test_copy_into_symlink_pointing_inside_source_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(os.path.join(proj, "sub"))
+            link = os.path.join(tmp, "into_sub")
+            os.symlink(os.path.join(proj, "sub"), link)
+            editor = self.browser(tmp, tmp)
+
+            editor._fb_perform_copy([proj], link, into_dir=True)
+
+            self.assertTrue(editor.message_is_error)
+            self.assertIn("inside itself", editor.message)
+            self.assertEqual(os.listdir(os.path.join(proj, "sub")), [])
+
+    def test_move_rebinds_buffer_opened_through_symlinked_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = os.path.join(tmp, "data")
+            archive = os.path.join(data, "archive")
+            os.makedirs(archive)
+            real_path = self.write(os.path.join(data, "f.txt"), "hello\n")
+            alias = os.path.join(tmp, "alias")
+            os.symlink(data, alias)
+            editor = ViEditor(os.path.join(alias, "f.txt"))
+
+            editor._fb_perform_move([real_path], archive, into_dir=True)
+
+            moved = os.path.join(archive, "f.txt")
+            self.assertFalse(editor.message_is_error, editor.message)
+            self.assertEqual(editor.filename, moved)
+            self.assertEqual(editor.buffers[editor.current_buffer].filename, moved)
+            editor.lines[0] = "edited"
+            self.assertTrue(editor._save_file())
+            self.assertFalse(os.path.exists(real_path))
+            with open(moved) as fh:
+                self.assertEqual(fh.read(), "edited\n")
+
+    def test_move_does_not_rebind_buffer_on_another_hard_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self.write(os.path.join(tmp, "a.txt"))
+            other = os.path.join(tmp, "b.txt")
+            os.link(src, other)
+            dest = os.path.join(tmp, "dest")
+            os.mkdir(dest)
+            editor = ViEditor(other)
+
+            editor._fb_perform_move([src], dest, into_dir=True)
+
+            self.assertFalse(editor.message_is_error, editor.message)
+            self.assertEqual(editor.filename, other)
+            self.assertTrue(os.path.exists(other))
+
+    def test_moving_a_symlink_does_not_rebind_buffer_on_its_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = self.write(os.path.join(tmp, "real.txt"))
+            link = os.path.join(tmp, "link.txt")
+            os.symlink(target, link)
+            dest = os.path.join(tmp, "dest")
+            os.mkdir(dest)
+            editor = ViEditor(target)
+
+            editor._fb_perform_move([link], dest, into_dir=True)
+
+            self.assertFalse(editor.message_is_error, editor.message)
+            self.assertTrue(os.path.islink(os.path.join(dest, "link.txt")))
+            self.assertEqual(editor.filename, target)
+
+    def test_cross_device_move_with_partial_cleanup_follows_the_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            dest = os.path.join(tmp, "dest")
+            os.mkdir(proj)
+            os.mkdir(dest)
+            open_path = self.write(os.path.join(proj, "open.txt"), "open\n")
+            self.write(os.path.join(proj, "other.txt"))
+            editor = ViEditor(open_path)
+            editor.file_browser.left.cwd = tmp
+            editor.file_browser.left.selected = {proj}
+            real_rename = os.rename
+
+            def rename(src, tgt):
+                if os.path.abspath(src) == proj:
+                    raise OSError(errno.EXDEV, "cross-device")
+                return real_rename(src, tgt)
+
+            def partial_rmtree(path, *args, **kwargs):
+                if os.path.abspath(path) == proj:
+                    os.unlink(open_path)
+                    raise OSError(errno.EACCES, "permission denied")
+                return shutil.rmtree(path, *args, **kwargs)
+
+            with mock.patch("vi_editor.os.rename", side_effect=rename), \
+                 mock.patch("vi_editor.shutil.rmtree", side_effect=partial_rmtree):
+                editor._fb_perform_move([proj], dest, into_dir=True)
+
+            moved = os.path.join(dest, "proj", "open.txt")
+            self.assertTrue(editor.message_is_error)
+            self.assertIn("source cleanup incomplete", editor.message)
+            self.assertEqual(editor.filename, moved)
+            self.assertEqual(editor.buffers[editor.current_buffer].filename, moved)
+            self.assertNotIn(proj, editor.file_browser.left.selected)
+            editor.lines[0] = "edited"
+            self.assertTrue(editor._save_file())
+            self.assertFalse(os.path.exists(open_path))
+
+    def _case_alias(self, tmp):
+        """foo.txt plus a second name for the same inode that the directory
+        listing hides -- what a case-insensitive filesystem looks like."""
+        src = self.write(os.path.join(tmp, "foo.txt"))
+        tgt = os.path.join(tmp, "Foo.txt")
+        os.link(src, tgt)
+        real_listdir = os.listdir
+
+        def listdir(path="."):
+            return [n for n in real_listdir(path) if n != "Foo.txt"]
+
+        return src, tgt, mock.patch("vi_editor.os.listdir", side_effect=listdir)
+
+    def test_case_only_rename_on_case_insensitive_filesystem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, tgt, hide = self._case_alias(tmp)
+            editor = ViEditor(src)
+            renames = []
+
+            def rename(a, b):
+                renames.append((a, b))
+
+            with hide, mock.patch("vi_editor.os.rename", side_effect=rename):
+                editor._fb_perform_move([src], tgt)
+
+            self.assertFalse(editor.file_browser.op_prompt)
+            self.assertFalse(editor.message_is_error, editor.message)
+            # Straight rename: the source is never moved aside as a "backup".
+            self.assertEqual(renames, [(src, tgt)])
+            self.assertEqual(editor.filename, tgt)
+
+    def test_case_alias_copy_is_still_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, tgt, hide = self._case_alias(tmp)
+            editor = ViEditor()
+            with hide:
+                editor._fb_perform_copy([src], tgt)
+            self.assertTrue(editor.message_is_error)
+            self.assertIn("onto itself", editor.message)
+
+    def test_move_onto_listed_hard_link_is_still_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self.write(os.path.join(tmp, "foo.txt"))
+            tgt = os.path.join(tmp, "Foo.txt")
+            os.link(src, tgt)
+            editor = ViEditor()
+            editor._fb_perform_move([src], tgt)
+            self.assertTrue(editor.message_is_error)
+            self.assertIn("onto itself", editor.message)
+            self.assertTrue(os.path.exists(src))
+
+    def test_listing_rereads_sizes_changed_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(os.path.join(tmp, "log.txt"), "a\n")
+            editor = self.browser(tmp, tmp)
+            panel = editor.file_browser.left
+            clock = [1000.0]
+
+            def size():
+                entries = editor._fb_entries(panel)
+                return next(e.size for e in entries if e.name == "log.txt")
+
+            with mock.patch("vi_editor.time.monotonic", side_effect=lambda: clock[0]):
+                editor._invalidate_fb_entries(panel)
+                self.assertEqual(size(), 2)
+                dir_mtime = os.stat(tmp).st_mtime_ns
+                with open(path, "a") as fh:
+                    fh.write("more\n")
+                self.assertEqual(os.stat(tmp).st_mtime_ns, dir_mtime)
+                clock[0] += editor.FB_ENTRIES_MAX_AGE_SECONDS / 2
+                self.assertEqual(size(), 2)
+                clock[0] += editor.FB_ENTRIES_MAX_AGE_SECONDS
+                self.assertEqual(size(), 7)
 
 
 if __name__ == "__main__":

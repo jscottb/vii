@@ -22,6 +22,7 @@ import fnmatch
 import json
 import base64
 import hashlib
+import array
 import mmap
 import secrets
 import selectors
@@ -212,20 +213,31 @@ class TrackedLines(list):
 
 
 class MMapLineStore(MutableSequence):
-    """List-like, read-on-demand line storage for large files."""
+    """List-like, read-on-demand line storage for large files.
+
+    Line i is the bytes [_starts[i], _starts[i + 1] - len(its ending)) of the
+    mapping. Offsets live in an array('Q') and endings as one code byte per
+    line (9 bytes a line): a list of (start, end) tuples cost ~130 bytes a
+    line, more than simply decoding the whole file into a list of str."""
+
+    _ENDINGS = ("", "\n", "\r\n", "\r")
+    _ENDING_CODES = {"": 0, "\n": 1, "\r\n": 2, "\r": 3}
+    # Bytes decoded per batch when materializing, so the temporary copy of
+    # the raw bytes stays bounded no matter how large the file is.
+    MATERIALIZE_CHUNK = 64 * 1024 * 1024
 
     def __init__(self, filename: str, encoding: str = "utf-8"):
         self.filename = filename
         self.encoding = encoding
         self._fh = _open_regular_file(filename)
         self._mmap = None
-        self._ranges: List[Tuple[int, int]] = [(0, 0)]
+        self._starts = array.array("Q", [0, 0])
+        self._ending_codes = bytearray(1)
         self._lines: Optional[List[str]] = None
         self._size = os.fstat(self._fh.fileno()).st_size
         self._mutation_callback: Optional[Callable[[int], None]] = None
         if self._size == 0:
             self._lines = [""]
-            self._line_endings = [""]
             self.close()
             return
         try:
@@ -234,7 +246,6 @@ class MMapLineStore(MutableSequence):
             # The file was truncated to zero between the fstat above and the
             # mmap call; treat it as empty rather than crashing the load.
             self._lines = [""]
-            self._line_endings = [""]
             self.close()
             return
         except OSError:
@@ -245,15 +256,19 @@ class MMapLineStore(MutableSequence):
             # OSError and never gets a reference to this object to close it.
             self.close()
             raise
-        self._ranges, self._line_endings = self._build_ranges()
+        self._starts, self._ending_codes = self._build_ranges()
 
-    def _build_ranges(self) -> Tuple[List[Tuple[int, int]], List[str]]:
+    def _build_ranges(self) -> Tuple["array.array[int]", bytearray]:
+        """(line start offsets plus a final end-of-data offset, one ending
+        code per line)."""
         size = len(self._mmap)
         if size == 0:
-            return [(0, 0)], [""]
+            return array.array("Q", [0, 0]), bytearray(1)
 
-        ranges: List[Tuple[int, int]] = []
-        endings: List[str] = []
+        starts = array.array("Q")
+        codes = bytearray()
+        add_start = starts.append
+        add_code = codes.append
         mm = self._mmap
         start = 0
         # mmap.find runs at C speed; a per-byte Python loop takes seconds for
@@ -265,49 +280,100 @@ class MMapLineStore(MutableSequence):
                 nl = mm.find(b"\n", start)
             if 0 <= cr < start:
                 cr = mm.find(b"\r", start)
+            add_start(start)
             if nl == -1 and cr == -1:
-                ranges.append((start, size))
-                endings.append("")
+                add_code(0)
+                start = size
                 break
             if cr != -1 and (nl == -1 or cr < nl):
-                ranges.append((start, cr))
                 if cr + 1 < size and mm[cr + 1] == 10:
-                    endings.append("\r\n")
+                    add_code(2)
                     start = cr + 2
                 else:
-                    endings.append("\r")
+                    add_code(3)
                     start = cr + 1
             else:
-                ranges.append((start, nl))
-                endings.append("\n")
+                add_code(1)
                 start = nl + 1
-        if not ranges:
-            ranges.append((0, 0))
-            endings.append("")
-        return ranges, endings
+        if not codes:
+            return array.array("Q", [0, 0]), bytearray(1)
+        add_start(start)
+        return starts, codes
 
-    def _materialize(self) -> List[str]:
-        if self._lines is None:
-            self._lines = [self._line_at(i) for i in range(len(self._ranges))]
-            self.close()
-        return self._lines
+    def _line_count(self) -> int:
+        return len(self._ending_codes)
 
-    def _line_at(self, index: int) -> str:
-        if self._mmap is None:
-            raise RuntimeError("mmap is closed")
-        start, end = self._ranges[index]
-        # If the file shrank externally, pages past the new EOF are unmapped
-        # and reading them raises SIGBUS, which kills the process uncatchably.
-        # Clamp to the current size; this is best-effort (the file can still
-        # shrink between the fstat and the read) but closes almost all of the
-        # window. Truncated-away lines read back as empty.
+    def _readable_limit(self) -> int:
+        """Bytes of the mapping that are still backed by the file. If the
+        file shrank externally, pages past the new EOF are unmapped and
+        reading them raises SIGBUS, which kills the process uncatchably, so
+        every read is clamped to this. One fstat covers a whole batch of
+        reads; the window between it and the read stays best-effort."""
         try:
             current_size = os.fstat(self._fh.fileno()).st_size
         except (OSError, ValueError, AttributeError):
             current_size = 0
-        if current_size < self._size:
-            end = min(end, current_size)
-            start = min(start, end)
+        return min(self._size, current_size)
+
+    def shrunk(self) -> bool:
+        """True while mapped if the file is now shorter than when it was
+        mapped: lines past the new end read back empty or cut short, so the
+        mapping no longer shows the file's text."""
+        return self.is_mapped and self._readable_limit() < self._size
+
+    def _materialize(self) -> List[str]:
+        if self._lines is None:
+            limit = self._readable_limit()
+            lines: List[str] = []
+            if limit < self._size:
+                lines = [self._line_at(i, limit) for i in range(self._line_count())]
+            else:
+                for first, last in self._batches():
+                    lines.extend(self._decode_batch(first, last))
+            self._lines = lines
+            self.close()
+        return self._lines
+
+    def _batches(self) -> Iterator[Tuple[int, int]]:
+        """[first, last) line batches of about MATERIALIZE_CHUNK bytes."""
+        starts = self._starts
+        count = self._line_count()
+        first = 0
+        while first < count:
+            last = first + 1
+            step = 1
+            while (last < count
+                   and starts[min(count, last + step)] - starts[first] <= self.MATERIALIZE_CHUNK):
+                last = min(count, last + step)
+                step *= 2
+            yield first, last
+            first = last
+
+    def _decode_batch(self, first: int, last: int) -> List[str]:
+        """Decode lines first..last-1 with one bytes.splitlines (C speed),
+        which breaks on exactly the \n / \r\n / \r boundaries
+        _build_ranges uses."""
+        starts = self._starts
+        parts = self._mmap[starts[first]:starts[last]].splitlines()
+        if len(parts) != last - first:
+            # Defensive: never let a disagreement shift every later line.
+            parts = [self._mmap[starts[i]:self._line_end(i)] for i in range(first, last)]
+        encoding = self.encoding
+        return [part.decode(encoding, errors="replace") for part in parts]
+
+    def _line_end(self, index: int) -> int:
+        return self._starts[index + 1] - len(self._ENDINGS[self._ending_codes[index]])
+
+    def _line_at(self, index: int, limit: Optional[int] = None) -> str:
+        if self._mmap is None:
+            raise RuntimeError("mmap is closed")
+        if limit is None:
+            limit = self._readable_limit()
+        start = self._starts[index]
+        end = self._line_end(index)
+        # Truncated-away lines read back as empty.
+        end = min(end, limit)
+        start = min(start, end)
         return self._mmap[start:end].decode(self.encoding, errors="replace")
 
     def has_lossy_decode(self) -> bool:
@@ -327,11 +393,12 @@ class MMapLineStore(MutableSequence):
             self._fh.seek(0)
 
     def line_endings(self) -> List[str]:
-        return list(self._line_endings)
+        endings = self._ENDINGS
+        return [endings[code] for code in self._ending_codes]
 
     def line_ending_at(self, row: int) -> Optional[str]:
-        if 0 <= row < len(self._line_endings):
-            return self._line_endings[row]
+        if 0 <= row < len(self._ending_codes):
+            return self._ENDINGS[self._ending_codes[row]]
         return None
 
     def raw_bytes(self) -> Optional[bytes]:
@@ -374,14 +441,15 @@ class MMapLineStore(MutableSequence):
             pass
 
     def __len__(self) -> int:
-        return len(self._lines) if self._lines is not None else len(self._ranges)
+        return len(self._lines) if self._lines is not None else self._line_count()
 
     def __getitem__(self, index):
         if self._lines is not None:
             return self._lines[index]
         if isinstance(index, slice):
             start, stop, step = index.indices(len(self))
-            return [self[i] for i in range(start, stop, step)]
+            limit = self._readable_limit()
+            return [self._line_at(i, limit) for i in range(start, stop, step)]
         if index < 0:
             index += len(self)
         if index < 0 or index >= len(self):
@@ -433,8 +501,26 @@ class MMapLineStore(MutableSequence):
             self._mutation_callback(max(0, index))
 
     def __iter__(self) -> Iterator[str]:
-        for i in range(len(self)):
+        count = len(self)
+        i = 0
+        if self._lines is None:
+            limit = self._readable_limit()
+            if limit >= self._size:
+                # Bulk-decode a batch at a time (search, hashing, snapshots).
+                for first, last in self._batches():
+                    if self._lines is not None:
+                        break
+                    for line in self._decode_batch(first, last):
+                        # Materialized mid-iteration: the list is now live.
+                        yield line if self._lines is None else self._lines[i]
+                        i += 1
+            else:
+                while i < count and self._lines is None:
+                    yield self._line_at(i, limit)
+                    i += 1
+        while i < count:
             yield self[i]
+            i += 1
 
     def __eq__(self, other):
         try:
@@ -464,6 +550,9 @@ class BufferState:
     last_jump: Optional[Tuple[int, int]] = None
     buffer_id: object = field(default_factory=object, compare=False, repr=False)
     top_wrap: int = 0
+    # The buffer's own line ending (vim's 'fileformat'): new lines get it and
+    # a save writes it. None means "use the lnendings option".
+    line_ending: Optional[str] = None
 
 
 @dataclass
@@ -486,6 +575,12 @@ class FileBrowserPanel:
     selected: set[str] = field(default_factory=set)
     entries_cache_key: Optional[Tuple[object, ...]] = None
     entries_cache: List[FileBrowserEntry] = field(default_factory=list)
+    entries_cache_time: float = 0.0
+
+
+class _FbSourceCleanupError(OSError):
+    """A cross-device move copied everything to its target, but removing
+    the source failed: the item has moved, with leftovers to report."""
 
 
 @dataclass
@@ -599,11 +694,19 @@ class ViiEditor:
     STATUS_PAIR = 11
     BOTTOM_STATUS_PAIR = 12
     ERROR_PAIR = 13
+    LE_LETTER_PAIR = 14
+    LE_BRACKET_PAIR = 15
     MAX_INTELLISENSE_MATCHES = 50
     MAX_INTELLISENSE_SCAN_LINES = 20000
     MAX_INTELLISENSE_LINE_CHARS = 20000
+    # Characters of line text the completion word cache may cover: enough
+    # for a full scan window of ordinary-length lines.
+    INTELLISENSE_WORD_CACHE_CHARS = 8_000_000
     SHELL_COMMAND_TIMEOUT_SECONDS = 10.0
     SHELL_COMMAND_MAX_OUTPUT_BYTES = 1024 * 1024
+    # The directory's own stat doesn't change when a file in it grows in
+    # place, so cached sizes/dates are re-read at most this old.
+    FB_ENTRIES_MAX_AGE_SECONDS = 2.0
     FB_GREP_TIMEOUT_SECONDS = 10.0
     FB_GREP_MAX_RESULTS = 5000
     FB_GREP_MAX_LINE_BYTES = 1 << 20
@@ -931,6 +1034,10 @@ class ViiEditor:
     # exists to avoid.
     _PASTE_NEWLINE = object()
 
+    # A Tab that inserted indentation must keep doing that during replay,
+    # even if preceding replayed text has opened the completion menu.
+    _INSERT_INDENT = object()
+
     # Terminal bracketed-paste escape sequences (xterm/most terminals):
     # wrapping ON/OFF is sent once per edit() session; START/END (without
     # the leading ESC, which is read separately) bracket each paste.
@@ -980,8 +1087,9 @@ class ViiEditor:
         "  ESC                  return to normal mode",
         "  Ctrl-A / Ctrl-E      move to line start / end",
         "  Backspace            delete before cursor; at col 0 joins with previous line",
+        "  Backspace (Replace)  undo what this R session typed; otherwise just move back",
         "  Delete / Ctrl-D      delete under cursor",
-        "  Enter                split line, copying leading indent",
+        "  Enter  o  O          new line copying leading indent (dropped if left unused)",
         "  paste (bracketed)    inserted literally; embedded newlines don't re-indent",
         "  Tab                  insert shiftwidth spaces (or literal tab if noexpandtab)",
         "  Shift-Tab            dedent by one indent step before cursor",
@@ -1024,7 +1132,9 @@ class ViiEditor:
         "  d x  y  c s         delete / yank / change selection",
         "  S                    change selected whole lines",
         "  > <                  indent / dedent",
-        "  ~                    toggle case",
+        "  ~ u U                toggle case / lowercase / uppercase",
+        "  r{char}              replace every selected character with {char}",
+        "  iw aw                select inner / around word",
         "  J                    join selected lines",
         "  p                    replace selection; deleted text becomes new register",
         "  P                    replace selection; register preserved",
@@ -1032,7 +1142,6 @@ class ViiEditor:
         "  Ctrl-V $             block: extend every row to its line end",
         "  Ctrl-V I / A         block: insert before / append after on every row",
         "  Ctrl-V c s           block: change; typed text repeats on every row",
-        "  Ctrl-V r{char}       block: replace every character with {char}",
         "  p P (normal)         a yanked block is put as a column at the cursor",
         "",
         "Shell",
@@ -1160,7 +1269,7 @@ class ViiEditor:
         "  :N,Mc  :*c           copy line range to yank register (% = current, $ = last; * = all)",
         "  :g/pat/cmd  :v/pat/cmd  run cmd on every line matching / not matching pat (! also inverts)",
         "  :hex                 read-only hex view (q/ESC closes)",
-        "  :le  :le-unix  :le-win  line-ending view / set default endings",
+        "  :le  :le-unix  :le-win  line-ending view / convert this file (and set lnendings)",
         "  :b64d file           base64-decode file into current buffer",
         "  :b64e file           base64-encode current buffer to file",
         "  :fb                  file browser",
@@ -1193,7 +1302,7 @@ class ViiEditor:
         "  visualmarks          set '< and '> marks when leaving visual mode (default off)",
         "  tabstop=N  ts=N      visual width of a hard tab",
         "  shiftwidth=N  sw=N   columns per indent step",
-        "  lnendings=unix|win   default line endings for new text",
+        "  lnendings=unix|win   endings for new buffers and mixed files (a file keeps its own)",
         "  undolevels=N  ul=N   undo history depth",
         "  intellisense         buffer-word insert completion (nointellisense to disable)",
         "  scrolljump=N  sj=N   vertical scroll step",
@@ -1255,9 +1364,11 @@ class ViiEditor:
         self._intellisense_completion_index = 0
         self._intellisense_completion_prefix = ""
         self._intellisense_completion_complete = False
+        self._intellisense_completion_context: Optional[Tuple[int, int]] = None
         # line text -> tuple of words; line strings are immutable and reused
         # across keystrokes, so unchanged rows skip the regex scan entirely.
         self._intellisense_line_words: dict = {}
+        self._intellisense_cache_chars = 0
 
         # Scrolling
         self.top_line = 0
@@ -1338,6 +1449,9 @@ class ViiEditor:
         self._block_to_eol = False
         # Pending blockwise I/A/c: replicated onto the other rows on ESC.
         self._block_insert: Optional[dict] = None
+        # (row, indent) when Enter / o / O just copied indent onto an
+        # otherwise empty line; see _take_unused_autoindent.
+        self._autoindent_pending: Optional[Tuple[int, str]] = None
         self.marks: dict[str, Tuple[int, int]] = {}
         self.auto_marks: dict[int, int] = {}   # {id: current_line}; id is an opaque unique key (see _set_auto_mark)
         self.last_jump: Optional[Tuple[int, int]] = None
@@ -1370,8 +1484,11 @@ class ViiEditor:
         self._hex_line_count = 1           # cached by _open_hex_view
         self._hex_cached_data: bytes = b""  # byte image cached by _open_hex_view
         self._hex_cached_data_len = 0
+        self._hex_source_label = ""        # what the open hex view shows (file path)
+        self._hex_return_mode = Mode.NORMAL
         self.line_endings_top_line = 0
         self._line_endings_line_count = 1  # cached by _open_line_endings_view
+        self._line_endings_convert_on_save = False  # cached likewise
         self._overlay_pending_g = False    # first "g" of gg seen in a scroll overlay
         self.shell_top_line = 0
         self.shell_lines: List[str] = []
@@ -1417,6 +1534,10 @@ class ViiEditor:
         self.shift_width = 4
         self.expand_tab  = True
         self.max_undo    = 200
+        # lnendings option: the ending for new buffers and for files whose
+        # lines don't all end alike. default_line_ending is the *current
+        # buffer's* ending (detected on load, swapped with the buffer).
+        self.lnendings_option = "\n"
         self.default_line_ending = "\n"
         self.intellisense = False
         self.markdown_wrap = True
@@ -1448,6 +1569,8 @@ class ViiEditor:
         self.status_attr = curses.A_REVERSE
         self.bottom_status_attr = curses.A_REVERSE
         self.error_attr = 0   # filled by _reinit_colors() once curses is up
+        self.le_letter_attr = 0    # line-endings view marker letters (blue)
+        self.le_bracket_attr = 0   # line-endings view marker brackets (green)
 
         # curses window; set by run() so that color-change :set opts can reinit pairs
         self._stdscr = None
@@ -1480,18 +1603,35 @@ class ViiEditor:
         """Return the string inserted by one indent step (Tab key, > operator)."""
         return " " * self.shift_width if self.expand_tab else "\t"
 
-    def _default_line_ending_name(self) -> str:
-        return "windows" if self.default_line_ending == "\r\n" else "unix"
+    def _default_line_ending_name(self, ending: Optional[str] = None) -> str:
+        """Name of `ending` (the current buffer's when omitted)."""
+        ending = self.default_line_ending if ending is None else ending
+        return "windows" if ending == "\r\n" else "unix"
 
     def _set_default_line_endings(self, style: str) -> str:
+        """Set the lnendings option and the current buffer's ending, so the
+        next :w writes it -- :le-win / :le-unix convert a file this way."""
         value = style.strip().lower()
         if value in ("unix", "lf", "nl"):
-            self.default_line_ending = "\n"
-            return ""
-        if value in ("win", "windows", "dos", "crlf"):
-            self.default_line_ending = "\r\n"
-            return ""
-        return f"lnendings must be unix or win: {style!r}"
+            ending = "\n"
+        elif value in ("win", "windows", "dos", "crlf"):
+            ending = "\r\n"
+        else:
+            return f"lnendings must be unix or win: {style!r}"
+        self.lnendings_option = ending
+        self.default_line_ending = ending
+        return ""
+
+    def _detect_line_ending(self, endings: List[str]) -> str:
+        """A file whose line breaks are all LF or all CRLF keeps that ending;
+        a mixed file (or one with no breaks) takes the lnendings option."""
+        seen = set(endings)
+        seen.discard("")
+        if len(seen) == 1:
+            (only,) = seen
+            if only in ("\n", "\r\n"):
+                return only
+        return self.lnendings_option
 
     def _parse_color(self, name: str):
         """Return the curses colour integer for *name*, or None if unknown."""
@@ -1545,6 +1685,8 @@ class ViiEditor:
                 error_fg = self._COLOR_NAMES["black"]
             curses.init_pair(self.ERROR_PAIR, error_fg, bottom_bg)
             self.error_attr = curses.color_pair(self.ERROR_PAIR)
+            self.le_letter_attr = _pair("blue", self.LE_LETTER_PAIR) | curses.A_BOLD
+            self.le_bracket_attr = _pair("green", self.LE_BRACKET_PAIR) | curses.A_BOLD
 
             self.syntax_attrs = {
                 "comment": curses.color_pair(self.SYNTAX_PAIR_COMMENT) | curses.A_DIM,
@@ -1743,8 +1885,8 @@ class ViiEditor:
             "sw":      lambda: f"shiftwidth={self.shift_width}",
             "undolevels": lambda: f"undolevels={self.max_undo}",
             "ul":      lambda: f"undolevels={self.max_undo}",
-            "lnendings": lambda: f"lnendings={self._default_line_ending_name()}",
-            "lineendings": lambda: f"lnendings={self._default_line_ending_name()}",
+            "lnendings": lambda: f"lnendings={self._default_line_ending_name(self.lnendings_option)}",
+            "lineendings": lambda: f"lnendings={self._default_line_ending_name(self.lnendings_option)}",
             "sessionfiles": lambda: f"sessionfiles={self.session_max_files}",
             "sessfiles": lambda: f"sessionfiles={self.session_max_files}",
             "scrolljump": lambda: f"scrolljump={self.vertical_scroll_jump}",
@@ -1955,7 +2097,7 @@ set backup                  " write generation backups on save  (nobackup to dis
 
 " ── Editing ──────────────────────────────────────────────────────────────────
 " set intellisense        " suggest words from the current buffer in insert mode
-" set lnendings=unix        " default line endings: unix or win
+" set lnendings=unix        " endings for new buffers and mixed files: unix or win
 " set undolevels=200         " maximum number of undo steps kept in memory
 
 " ── Scrolling ────────────────────────────────────────────────────────────────
@@ -2754,6 +2896,8 @@ set errorcolor=black          " error message text colour on the bottom line
 
     def _on_lines_mutated(self, first_row: int) -> None:
         """Invalidate incremental state at and after an in-place line edit."""
+        self._wanted_col = None
+        self._wrap_motion_cursor = None
         self._md_hot_block = None
         first_row = max(0, first_row)
         for checkpoints in self._clike_checkpoints.values():
@@ -2893,30 +3037,49 @@ set errorcolor=black          " error message text colour on the bottom line
         line_endings = self.line_endings if line_endings is None else line_endings
         filename_sig = self._signature_filename(self.filename)
         if isinstance(self.lines, MMapLineStore) and self.lines.is_mapped:
-            try:
-                return self._file_signature(self.lines.filename) + (
+            file_part = self._mapped_file_part(self._saved_signature, self.lines.filename)
+            if file_part is not None:
+                return file_part + (
                     self._line_endings_signature(line_endings),
                     self.line_endings_trusted,
                     filename_sig,
                 )
-            except OSError:
-                pass
         return self._line_signature(self.lines, line_endings) + (
             self.line_endings_trusted,
             filename_sig,
         )
 
+    def _mapped_file_part(self, saved_signature, filename: str):
+        """The ("file", path, size, mtime) head of a still-mapped buffer's
+        signature. A file that only grew on disk (a log being appended to)
+        still maps exactly the text that was loaded -- the mapping's length
+        is fixed -- so keep the saved head for it. Re-statting it made an
+        untouched buffer look modified: :q / :bd refused, steering the user
+        to :w!, which writes the shorter mapped text over the file and
+        throws away everything appended since. A rewrite that leaves the
+        size alone does change what the shared mapping shows, so it still
+        counts (and a shrink reloads -- see _reload_if_mapped_file_shrank)."""
+        try:
+            current = self._file_signature(filename)
+        except OSError:
+            return None
+        if (isinstance(saved_signature, tuple) and saved_signature[:1] == ("file",)
+                and len(saved_signature) >= 4
+                and saved_signature[1] == current[1]
+                and current[2] > saved_signature[2]):
+            return saved_signature[:4]
+        return current
+
     def _buffer_signature(self, b: BufferState):
         filename_sig = self._signature_filename(b.filename)
         if isinstance(b.lines, MMapLineStore) and b.lines.is_mapped:
-            try:
-                return self._file_signature(b.lines.filename) + (
+            file_part = self._mapped_file_part(b.saved_signature, b.lines.filename)
+            if file_part is not None:
+                return file_part + (
                     self._line_endings_signature(b.line_endings),
                     b.line_endings_trusted,
                     filename_sig,
                 )
-            except OSError:
-                pass
         return self._line_signature(b.lines, b.line_endings) + (
             b.line_endings_trusted,
             filename_sig,
@@ -3062,6 +3225,7 @@ set errorcolor=black          " error message text colour on the bottom line
             last_jump=self.last_jump,
             buffer_id=self._buffer_id,
             top_wrap=self._top_wrap,
+            line_ending=self.default_line_ending,
         )
 
     def _sync_current_buffer(self):
@@ -3081,6 +3245,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self.lines = b.lines or [""]
         self.line_endings = list(b.line_endings)
         self.line_endings_trusted = b.line_endings_trusted
+        self.default_line_ending = b.line_ending or self.lnendings_option
         self.log_type = b.log_type
         self._saved_signature = b.saved_signature
         self._saved_file_signature = b.saved_file_signature
@@ -3347,6 +3512,7 @@ set errorcolor=black          " error message text colour on the bottom line
         if not self.lines:
             self.lines = [""]
             self.line_endings = [""]
+        self.default_line_ending = self._detect_line_ending(self.line_endings)
         self._normalize_line_endings()
         self.line_endings_trusted = True
         self.filename = full_filename
@@ -3391,6 +3557,7 @@ set errorcolor=black          " error message text colour on the bottom line
             if not self.lines:
                 self.lines = [""]
                 self.line_endings = [""]
+            self.default_line_ending = self._detect_line_ending(self.line_endings)
             self.line_endings_trusted = True
             self.filename = None
             self._mark_clean()
@@ -3884,14 +4051,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 text, saved_endings = self._buffer_text_for_save()
                 # Saving joins with the default line ending; warn when that
                 # actually converts endings the file was loaded with.
-                endings_converted = (
-                    self.line_endings_trusted
-                    and len(self.line_endings) == len(self.lines)
-                    and any(
-                        ending and ending != self.default_line_ending
-                        for ending in self.line_endings
-                    )
-                )
+                endings_converted = self._save_would_convert_endings()
                 if skip_backup or not self.backup_enabled:
                     backup_state = None
                 else:
@@ -4508,6 +4668,55 @@ set errorcolor=black          " error message text colour on the bottom line
             del self.lines[row + 1]
             self._clamp_marks()
 
+    def _join_lines(self, row: int, joins: int):
+        """Join the `joins` lines after `row` onto it in a single pass, with
+        the same spacing and mark mapping as `joins` successive
+        _join_line(row) calls. Calling _join_line in a loop is quadratic --
+        each call re-copies the growing joined line and shifts the rest of
+        the buffer down by one -- so a visual J over a 100k-line selection
+        froze the editor for tens of seconds."""
+        last = min(row + joins, len(self.lines) - 1)
+        if last <= row:
+            return
+        parts = [self.lines[row]]
+        length = len(parts[0])
+        # source row -> (leading whitespace stripped, join point, tail start)
+        spans: dict[int, Tuple[int, int, int]] = {}
+        for r in range(row + 1, last + 1):
+            next_line = self.lines[r]
+            tail = next_line.lstrip()
+            sep = " " if tail else ""
+            spans[r] = (len(next_line) - len(tail), length, length + len(sep))
+            parts.append(sep)
+            parts.append(tail)
+            length += len(sep) + len(tail)
+        removed = last - row
+        adjusted = {}
+        for name, (mark_row, mark_col) in self._edit_positions().items():
+            if row < mark_row <= last:
+                stripped, head_len, tail_start = spans[mark_row]
+                if mark_col < stripped:
+                    mark_col = head_len
+                else:
+                    mark_col = tail_start + mark_col - stripped
+                adjusted[name] = (row, mark_col)
+            elif mark_row > last:
+                adjusted[name] = (mark_row - removed, mark_col)
+            else:
+                adjusted[name] = (mark_row, mark_col)
+        self._set_edit_positions(adjusted)
+        self.auto_marks = {
+            id_: row if row < cur <= last else cur - removed if cur > last else cur
+            for id_, cur in self.auto_marks.items()
+        }
+        joined_ending = self._line_ending_for_row(last)
+        self.lines[row] = "".join(parts)
+        self._normalize_line_endings()
+        self.line_endings[row] = joined_ending
+        self._delete_line_endings(row + 1, last + 1)
+        del self.lines[row + 1:last + 1]
+        self._clamp_marks()
+
     def _delete_range(self, r1: int, c1: int, r2: int, c2: int,
                       linewise: bool) -> List[str]:
         """Delete region and return the deleted text as a list of strings."""
@@ -4692,11 +4901,42 @@ set errorcolor=black          " error message text colour on the bottom line
             return False
         return c2 >= c1
 
+    _VISUAL_CASE_FNS: dict = {
+        ord("~"): str.swapcase, ord("u"): str.lower, ord("U"): str.upper,
+    }
+
+    def _visual_rewrite(self, fn: Callable[[str], str]):
+        """v_~ v_u v_U v_r: rewrite the charwise/linewise selection in place
+        and make `.` redo it over a same-shaped region at the cursor."""
+        r1, c1, r2, c2 = self._visual_bounds()
+        linewise = self.mode == Mode.VISUAL_LINE
+        changes = self._visual_text_changes(r1, c1, r2, c2, linewise, fn)
+        if self._apply_row_changes(changes):
+            if linewise:
+                self._set_last_change(
+                    lambda span=r2 - r1, fn=fn:
+                    self._repeat_visual_toggle_case(0, span, linewise=True, fn=fn)
+                )
+            elif r1 == r2:
+                self._set_last_change(
+                    lambda cnt=max(0, c2 - c1 + 1), fn=fn:
+                    self._toggle_case_range(cnt, fn)
+                )
+            else:
+                self._set_last_change(
+                    lambda span=r2 - r1, end=c2, fn=fn:
+                    self._repeat_visual_toggle_case(0, span, end, fn=fn)
+                )
+        self.mode = Mode.NORMAL
+
     def _swap_visual_anchor(self):
         self.visual_start, current = (self.cursor_row, self.cursor_col), self.visual_start
         self._move(*current)
 
     def _replace_visual_selection(self, after: bool, exchange: bool = False):
+        if self.mode == Mode.VISUAL and self._pending_put_is_block():
+            self._replace_charwise_with_block(exchange)
+            return
         put_buffer, put_is_lines, put_line_endings = self._resolve_put_source()
         if not put_buffer:
             self.message = "Nothing in register"
@@ -4722,14 +4962,32 @@ set errorcolor=black          " error message text colour on the bottom line
             return
 
         deleted_endings = self._line_endings_for_range(r1, r2) if linewise else None
+        whole_buffer = linewise and r1 == 0 and r2 == len(self.lines) - 1
         self._push_undo()
         deleted = self._delete_range(r1, c1, r2, c2, linewise)
-        if linewise and put_is_lines and deleted == [""] and self.lines == [""]:
+        put_after = after and not linewise
+        if not linewise:
+            # _delete_range clamps the cursor for VISUAL mode (len - 1), which
+            # drags it one cell left of the deletion point when the selection
+            # ran to the end of the line. _put clamps the column to
+            # len(line) itself, so rest exactly at c1.
+            self.cursor_row, self.cursor_col = r1, c1
+        elif whole_buffer and put_is_lines:
             self.lines = []
             self.line_endings = []
             self.cursor_row = 0
             self.cursor_col = 0
-        elif linewise and not put_is_lines and not (deleted == [""] and self.lines == [""]):
+        elif put_is_lines and r1 >= len(self.lines):
+            # The selection included the last line: _delete_range parked the
+            # cursor on the line above, so the put goes after it, not before.
+            self._move(len(self.lines) - 1, 0)
+            put_after = True
+        elif whole_buffer:
+            # The lone "" _delete_range leaves is the placeholder line the
+            # charwise text splices into; keep the deleted text's final
+            # ending rather than the bare "" (which drops the last newline).
+            self.line_endings = [deleted_endings[-1]]
+        elif not put_is_lines:
             # A charwise register pasted over a linewise-deleted selection
             # needs a blank placeholder line to splice into (mirrors the
             # blank line _begin_substitute_lines leaves for "cc"/"S") --
@@ -4748,7 +5006,6 @@ set errorcolor=black          " error message text colour on the bottom line
         self.yank_buffer = saved_yank
         self.yank_is_lines = saved_is_lines
         self.yank_line_endings = saved_line_endings
-        put_after = after and not linewise
         if not linewise and put_is_lines:
             # A linewise register pasted over a charwise-deleted selection
             # needs to split the (now merged) line at the deletion point
@@ -4780,6 +5037,38 @@ set errorcolor=black          " error message text colour on the bottom line
         self.mode = Mode.NORMAL
         self.modified = True
         self._force_redraw = True
+
+    def _replace_charwise_with_block(self, exchange: bool):
+        """v_p / v_P from a charwise selection when the register holds a
+        block: delete the selection and put the block as a column at the
+        deletion point, like p does in NORMAL mode."""
+        register = self.active_register
+        pieces, _, _ = self._resolve_put_source()
+        if self._put_source_is_empty(pieces, False):
+            self.active_register = register
+            self.message = "Nothing in register"
+            self.message_is_error = True
+            self._force_redraw = True
+            return
+        r1, c1, r2, c2 = self._visual_bounds()
+        vcol = self._block_vcol(r1, c1)
+        # Row r1 keeps its prefix up to vcol; later pieces land on the rows
+        # that follow the selection once it is deleted.
+        if self._block_pad_refused(r2 + 1, len(pieces) - 1, vcol,
+                                   self._block_payload_cells(pieces)):
+            self.active_register = register
+            return
+        self.mode = Mode.NORMAL
+        self._push_undo()
+        deleted = self._delete_range(r1, c1, r2, c2, False)
+        self._move(r1, self._put_block_text(list(pieces), r1, vcol))
+        if exchange:
+            self._store_register(deleted, False)
+        self.modified = True
+        self._force_redraw = True
+        self._set_last_change(
+            lambda text=list(pieces): self._put_block_payload(text, after=False)
+        )
 
     # --- Visual block (Ctrl-V) ---------------------------------------------
     #
@@ -4865,11 +5154,47 @@ set errorcolor=black          " error message text colour on the bottom line
         vr = self._BLOCK_EOL if to_eol else vl + max(1, width) - 1
         return r1, r2, vl, vr
 
-    def _block_row_span(self, row: int, vl: int, vr: int) -> Tuple[int, int]:
-        """Half-open character range [c1, c2) of `row` whose display cells
-        overlap columns vl..vr. Rows that don't reach vl give an empty range
-        at the line end."""
+    def _split_straddling_cells(self, line: str, vcols: Tuple[int, ...],
+                                tabs_only: bool = False) -> str:
+        """`line` with every tab (and, unless tabs_only, wide character) that
+        straddles one of `vcols` -- starts before the column and still covers
+        it -- replaced by spaces of the same width. Each column then falls on
+        a character boundary, so cutting or inserting there leaves the cells
+        on either side where they were on screen."""
+        if line.isascii() and "\t" not in line and "\x00" not in line:
+            return line
+        targets = [v for v in vcols if v > 0]
+        out: List[str] = []
+        changed = False
+        v = 0
+        for ch, (_, width) in zip(line, self._display_chunks(line, 0)):
+            if (width > 1 and (ch == "\t" or not tabs_only)
+                    and any(v < t < v + width for t in targets)):
+                out.append(" " * width)
+                changed = True
+            else:
+                out.append(ch)
+            v += width
+        return "".join(out) if changed else line
+
+    def _block_split_row(self, row: int, vcols: Tuple[int, ...],
+                         tabs_only: bool = False) -> str:
+        """Apply _split_straddling_cells to buffer row `row` (adjusting marks)
+        and return the resulting line."""
         line = self.lines[row]
+        new = self._split_straddling_cells(line, vcols, tabs_only)
+        if new != line:
+            self._adjust_marks_for_line_replace(row, line, new)
+            self.lines[row] = new
+        return new
+
+    def _block_row_span(self, row: int, vl: int, vr: int) -> Tuple[int, int]:
+        return self._line_block_span(self.lines[row], vl, vr)
+
+    def _line_block_span(self, line: str, vl: int, vr: int) -> Tuple[int, int]:
+        """Half-open character range [c1, c2) of `line` whose display cells
+        overlap columns vl..vr. Lines that don't reach vl give an empty range
+        at the line end."""
         if line.isascii() and "\t" not in line and "\x00" not in line:
             return min(vl, len(line)), min(vr + 1, len(line))
         c1 = c2 = -1
@@ -4899,16 +5224,17 @@ set errorcolor=black          " error message text colour on the bottom line
     def _block_text(self, r1: int, r2: int, vl: int, vr: int) -> List[str]:
         pieces = []
         for row in range(r1, r2 + 1):
-            c1, c2 = self._block_row_span(row, vl, vr)
-            pieces.append(self.lines[row][c1:c2])
+            line = self._split_straddling_cells(self.lines[row], (vl, vr + 1))
+            c1, c2 = self._line_block_span(line, vl, vr)
+            pieces.append(line[c1:c2])
         return pieces
 
     def _block_delete_rows(self, r1: int, r2: int, vl: int, vr: int) -> List[str]:
         """Cut the block out of every row; returns the removed pieces."""
         deleted = []
         for row in range(r1, r2 + 1):
-            c1, c2 = self._block_row_span(row, vl, vr)
-            line = self.lines[row]
+            line = self._block_split_row(row, (vl, vr + 1))
+            c1, c2 = self._line_block_span(line, vl, vr)
             deleted.append(line[c1:c2])
             if c2 > c1:
                 self._adjust_marks_for_same_line_delete(row, c1, c2 - 1)
@@ -4936,17 +5262,23 @@ set errorcolor=black          " error message text colour on the bottom line
 
     def _block_transform(self, r1: int, r2: int, vl: int, vr: int,
                          kind: str, ch: str = ""):
-        """Rewrite the block's text in place: ~ toggles case, r replaces
-        every character with `ch`."""
+        """Rewrite the block's text in place: ~ / u / U change case, r
+        replaces every character with `ch`."""
         changed = False
         for row in range(r1, r2 + 1):
-            c1, c2 = self._block_row_span(row, vl, vr)
+            line = self.lines[row]
+            base = line if kind != "r" else self._split_straddling_cells(line, (vl, vr + 1))
+            c1, c2 = self._line_block_span(base, vl, vr)
             if c2 <= c1:
                 continue
-            line = self.lines[row]
-            piece = line[c1:c2]
-            piece = piece.swapcase() if kind == "~" else ch * len(piece)
-            new = line[:c1] + piece + line[c2:]
+            piece = base[c1:c2]
+            if kind != "r":
+                piece = self._VISUAL_CASE_FNS[ord(kind)](piece)
+            else:
+                cells = self._display_width(base[:c2]) - self._display_width(base[:c1])
+                ch_w = max(1, self._char_display_width(ch))
+                piece = ch * (cells // ch_w) + " " * (cells % ch_w)
+            new = base[:c1] + piece + base[c2:]
             if new == line:
                 continue
             if not changed:
@@ -4994,7 +5326,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 # Carry a missing final newline over to the new last row, as `o` does.
                 self._insert_line_endings(at, 1, self._line_ending_for_row(at - 1))
                 self.lines.insert(at, "")
-            line = self.lines[r]
+            line = self._block_split_row(r, (vcol,), tabs_only=True)
             line_w = self._display_width(line)
             if line_w < vcol:
                 line += " " * (vcol - line_w)
@@ -5144,14 +5476,20 @@ set errorcolor=black          " error message text colour on the bottom line
                 self._store_register(deleted, False, blockwise=True)
                 self.modified = True
                 self._force_redraw = True
+        # Keep preparation separate from a block change's deletion: only
+        # tab expansion and padding should be rolled back if nothing is typed.
+        before_prepare = self.lines[r1]
+        before_prepare_positions = {
+            name: pos for name, pos in self._edit_positions().items() if pos[0] == r1
+        }
+        if not (kind == "A" and to_eol):
+            self._block_split_row(r1, (vr + 1 if kind == "A" else vl,), tabs_only=True)
         line = self.lines[r1]
-        unpadded = None
         if kind == "A" and to_eol:
             col = len(line)
         elif kind == "A":
             line_w = self._display_width(line)
             if line_w <= vr:
-                unpadded = line
                 line += " " * (vr + 1 - line_w)
                 self.lines[r1] = line
             col = self._col_at_vcol(line, vr + 1)
@@ -5160,7 +5498,8 @@ set errorcolor=black          " error message text colour on the bottom line
         self._move_insert_cursor(r1, col)
         self._block_insert = {
             "kind": kind, "row": r1, "r2": r2, "vl": vl, "vr": vr,
-            "col": col, "orig": line, "unpadded": unpadded,
+            "col": col, "orig": line, "before_prepare": before_prepare,
+            "before_prepare_positions": before_prepare_positions,
             "nlines": len(self.lines),
         }
         self._insert_replay_setup = (
@@ -5169,22 +5508,34 @@ set errorcolor=black          " error message text colour on the bottom line
         )
 
     def _finish_block_insert(self) -> Optional[Tuple[int, int]]:
-        """Copy the text inserted on the block's first row onto its other
-        rows. Returns where the cursor should rest, or None when the insert
-        wasn't a plain single-line insertion (nothing is replicated then)."""
+        """Restore unused preparation and replicate a plain first-row insert.
+        Return a resting cursor only when still on the first row; edits
+        elsewhere keep their cursor and are never replicated."""
         info, self._block_insert = self._block_insert, None
         if info is None:
             return None
         r1, col, orig = info["row"], info["col"], info["orig"]
-        if len(self.lines) != info["nlines"] or self.cursor_row != r1:
+        if len(self.lines) != info["nlines"]:
             return None
+        on_first = self.cursor_row == r1
         new = self.lines[r1]
         if new == orig:
-            if info["unpadded"] is not None:
-                # Nothing typed after A: drop the padding A added.
-                self.lines[r1] = info["unpadded"]
+            restored = info["before_prepare"]
+            rest_col = col
+            if new != restored:
+                vcol = self._block_vcol(r1, col)
+                self.lines[r1] = restored
+                positions = self._edit_positions()
+                for name, saved in info["before_prepare_positions"].items():
+                    current = positions.get(name)
+                    if current is not None and current[0] == r1:
+                        positions[name] = saved
+                self._set_edit_positions(positions)
                 self._clamp_marks()
-            return (r1, col)
+                rest_col = self._col_at_vcol(restored, vcol)
+            return (r1, rest_col) if on_first else None
+        if not on_first:
+            return None
         delta = len(new) - len(orig)
         if delta <= 0 or new[:col] != orig[:col] or new[col + delta:] != orig[col:]:
             return None
@@ -5196,6 +5547,10 @@ set errorcolor=black          " error message text colour on the bottom line
             return (r1, col)
         vl, vr = info["vl"], info["vr"]
         for row in range(r1 + 1, info["r2"] + 1):
+            if info["kind"] == "A" and vr != self._BLOCK_EOL:
+                self._block_split_row(row, (vr + 1,), tabs_only=True)
+            elif info["kind"] != "A":
+                self._block_split_row(row, (vl,), tabs_only=True)
             line = self.lines[row]
             if info["kind"] == "A":
                 if vr == self._BLOCK_EOL:
@@ -8079,6 +8434,21 @@ set errorcolor=black          " error message text colour on the bottom line
             key, "help_top_line", len(self.HELP_LINES), (27, curses.KEY_F1, ord("q"))
         )
 
+    def _hex_disk_image_path(self) -> Optional[str]:
+        """The buffer's file when the bytes on disk are exactly what the
+        buffer holds: unmodified since it was loaded or saved, and the file
+        unchanged since then. Hex view then shows those bytes rather than
+        re-encoding the decoded text -- for non-UTF-8 content that round
+        trip turns every bad byte into EF BF BD, shifting all later offsets
+        (a still-mapped large file already showed its raw bytes, so the
+        same file read differently either side of the mmap threshold)."""
+        if not self.filename or self.modified:
+            return None
+        saved = self._saved_file_signature
+        if saved is None or saved != self._file_signature_or_none(self.filename):
+            return None
+        return self.filename
+
     def _buffer_hex_bytes(self) -> bytes:
         if isinstance(self.lines, MMapLineStore) and self.lines.is_mapped:
             # A still-mapped store is by definition unmodified, so the on-disk
@@ -8087,6 +8457,13 @@ set errorcolor=black          " error message text colour on the bottom line
             raw = self.lines.raw_bytes()
             if raw is not None:
                 return raw
+        disk_path = self._hex_disk_image_path()
+        if disk_path is not None:
+            try:
+                with _open_regular_file(disk_path) as fh:
+                    return fh.read(self.HEX_VIEW_MAX_BYTES + 1)
+            except OSError:
+                pass   # fall back to the buffer's own image
         return "".join(
             str(line) + self._line_ending_for_row(idx)
             for idx, line in enumerate(self.lines)
@@ -8097,6 +8474,12 @@ set errorcolor=black          " error message text colour on the bottom line
         so it can gate _buffer_hex_bytes()'s full materialization."""
         if isinstance(self.lines, MMapLineStore) and self.lines.is_mapped:
             return self.lines.byte_size()
+        disk_path = self._hex_disk_image_path()
+        if disk_path is not None:
+            try:
+                return os.path.getsize(disk_path)
+            except OSError:
+                pass
         # Must count encoded bytes, not characters: multi-byte UTF-8 content
         # (CJK, emoji, ...) can be up to 4x more bytes than characters, and
         # _buffer_hex_bytes() below encodes to UTF-8. A char-based count
@@ -8151,14 +8534,20 @@ set errorcolor=black          " error message text colour on the bottom line
         # in hand -- flipping mode first would leave HEX mode active with
         # a stale (or never-populated) cache if materialization above
         # failed.
-        self._open_hex_view_for_bytes(data)
+        self._open_hex_view_for_bytes(data, self.filename or "[No Name]")
 
-    def _open_hex_view_for_bytes(self, data: bytes):
+    def _open_hex_view_for_bytes(self, data: bytes, label: str = "",
+                                 return_mode: Mode = Mode.NORMAL):
         """Enter HEX mode over a precomputed byte image, bypassing any
         text-buffer decode/encode round trip. Used for exact-bytes sources
         (e.g. a file read straight off disk) where re-deriving the bytes
         from a decoded buffer -- as _open_hex_view()'s default path does --
-        would be lossy for non-UTF-8 content."""
+        would be lossy for non-UTF-8 content. `label` names what is shown
+        (the status line used to show the current buffer's file even for a
+        file browser F3 view of some other file), and closing the view
+        returns to `return_mode`."""
+        self._hex_source_label = label or self.filename or "[No Name]"
+        self._hex_return_mode = return_mode
         self.mode = Mode.HEX
         self.hex_top_line = 0
         self.hex_cursor_line = 0
@@ -8192,7 +8581,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self._add_curses_text(
                 scr, srow, 0, self._format_hex_line(offset, data[offset:offset + 16]), attr)
 
-        fname = self.filename or "[No Name]"
+        fname = self._hex_source_label or self.filename or "[No Name]"
         # Place the real terminal cursor on the current row too, like the
         # editor's own cursor does while scrolling, instead of leaving it
         # wherever the last draw call happened to land it.
@@ -8211,7 +8600,8 @@ set errorcolor=black          " error message text colour on the bottom line
 
     def _handle_hex(self, key: int) -> bool:
         if key in (27, ord("q")):
-            self.mode = Mode.NORMAL
+            self.mode = self._hex_return_mode
+            self._hex_return_mode = Mode.NORMAL
             self._count_str = ""
             self._pending_op = ""
             self._overlay_pending_g = False
@@ -8274,10 +8664,31 @@ set errorcolor=black          " error message text colour on the bottom line
             return "[NL]"
         return "[NONE]"
 
-    def _line_endings_view_line(self, idx: int) -> str:
+    def _line_endings_view_line(self, idx: int, width: Optional[int] = None) -> str:
+        """`idx`'s text followed by its ending marker. With `width`, text
+        too wide for the screen is cut (marked with "…") so the marker --
+        the point of this view -- always stays visible."""
         if idx >= len(self.lines):
             return "[NONE]"
-        return f"{self.lines[idx]}{self._line_ending_marker(self._line_ending_for_row(idx))}"
+        marker = self._line_ending_marker(self._line_ending_for_row(idx))
+        text = self.lines[idx]
+        if width is not None:
+            room = max(0, width - len(marker) - 1)      # last cell left free
+            if self._display_width(text) > room:
+                text = self._display_slice(text, 0, max_width=max(0, room - 1)) + "…"
+        return f"{text}{marker}"
+
+    def _save_would_convert_endings(self) -> bool:
+        """Whether the next save rewrites endings the file was loaded with
+        (a mixed file is normalized to the buffer's ending)."""
+        return (
+            self.line_endings_trusted
+            and len(self.line_endings) == len(self.lines)
+            and any(
+                ending and ending != self.default_line_ending
+                for ending in self.line_endings
+            )
+        )
 
     def _line_endings_view_lines(self) -> List[str]:
         return [
@@ -8291,6 +8702,8 @@ set errorcolor=black          " error message text colour on the bottom line
         # the rendered lines can't change while the view is open. Rows are
         # formatted lazily by _draw_line_endings; only the count is fixed here.
         self._line_endings_line_count = max(1, len(self.lines))
+        # Fixed for the same reason; one pass over the endings, not per draw.
+        self._line_endings_convert_on_save = self._save_would_convert_endings()
         self._clear_cmd_buf()
         self._count_str = ""
         self._pending_op = ""
@@ -8306,18 +8719,32 @@ set errorcolor=black          " error message text colour on the bottom line
             0, min(self.line_endings_top_line, max(0, total - text_rows)))
 
         fname = self.filename or "[No Name]"
+        save_note = (
+            f"  → {self._default_line_ending_name()} on :w"
+            if self._line_endings_convert_on_save else ""
+        )
         self._draw_overlay_frame(
             stdscr, height, width,
-            status_left=f" LE      {fname}",
+            status_left=f" LE      {fname}{save_note}",
             status_right=f" {self.line_endings_top_line + 1}-{min(total, self.line_endings_top_line + text_rows)}/{total} ",
             total=total, top_line=self.line_endings_top_line,
-            draw_row=lambda scr, srow, idx: self._add_curses_text(
-                scr, srow, 0, self._line_endings_view_line(idx)),
+            draw_row=lambda scr, srow, idx: self._draw_line_endings_row(
+                scr, srow, idx, width),
             filler=True,
             bottom=lambda win: self._draw_overlay_bottom(
                 win, width,
                 r"ESC/q close; [CR]=\r [NL]=\n [CRLF]=\r\n [NONE]=no final ending"),
         )
+
+    def _draw_line_endings_row(self, stdscr, srow: int, idx: int, width: int):
+        """Draw one view row: the text plain, then the ending marker with
+        its letters in blue and its brackets in green."""
+        line = self._line_endings_view_line(idx, width)
+        start = line.rindex("[")
+        col = self._add_curses_text(stdscr, srow, 0, line[:start])
+        col += self._add_curses_text(stdscr, srow, col, "[", self.le_bracket_attr)
+        col += self._add_curses_text(stdscr, srow, col, line[start + 1:-1], self.le_letter_attr)
+        self._add_curses_text(stdscr, srow, col, "]", self.le_bracket_attr)
 
     def _handle_line_endings(self, key: int) -> bool:
         return self._handle_scroll_overlay(
@@ -8610,7 +9037,9 @@ set errorcolor=black          " error message text colour on the bottom line
 
     def _fb_entries(self, panel: FileBrowserPanel) -> List[FileBrowserEntry]:
         cache_key = self._fb_entries_cache_key(panel)
-        if panel.entries_cache_key == cache_key:
+        now = time.monotonic()
+        if (panel.entries_cache_key == cache_key
+                and now - panel.entries_cache_time < self.FB_ENTRIES_MAX_AGE_SECONDS):
             return panel.entries_cache
 
         parent_path = os.path.dirname(panel.cwd) or panel.cwd
@@ -8659,6 +9088,7 @@ set errorcolor=black          " error message text colour on the bottom line
         sorted_dirs  = sorted(dirs,  key=sort_key, reverse=panel.reverse_sort)
         sorted_files = sorted(files, key=sort_key, reverse=panel.reverse_sort)
         panel.entries_cache_key = cache_key
+        panel.entries_cache_time = now
         panel.entries_cache = parent + sorted_dirs + sorted_files
         return panel.entries_cache
 
@@ -8796,7 +9226,10 @@ set errorcolor=black          " error message text colour on the bottom line
         selected = self._fb_selected_entry()
         selected_name = selected.name if selected else ""
         left_s = f" FB      {active.cwd}"
-        right_s = f" {selected_name}  sort:{active.sort_mode}{' rev' if active.reverse_sort else ''} "
+        marked = len(self._fb_marks_here(active))
+        marked_s = f"  {marked} marked" if marked else ""
+        right_s = (f" {selected_name}{marked_s}  sort:{active.sort_mode}"
+                   f"{' rev' if active.reverse_sort else ''} ")
         status = self._format_status(left_s, right_s, width)
         _fb_prompt_cursor_col: Optional[int] = None
         try:
@@ -8880,10 +9313,8 @@ set errorcolor=black          " error message text colour on the bottom line
         self._force_redraw = True
 
     def _open_marked_file_browser_entries(self, panel: FileBrowserPanel) -> bool:
-        paths = sorted(
-            path for path in panel.selected
-            if os.path.isfile(path)
-        )
+        marked = self._fb_marks_here(panel)
+        paths = [path for path in marked if os.path.isfile(path)]
         if not paths:
             return False
         saved_mode = self.mode
@@ -8893,7 +9324,7 @@ set errorcolor=black          " error message text colour on the bottom line
             if self._append_buffer(path, switch=not first_opened):
                 first_opened = True
                 opened += 1
-        panel.selected.clear()
+        panel.selected.difference_update(marked)
         if opened:
             self.mode = Mode.NORMAL
             self.message = f"{opened} file{'s' if opened != 1 else ''} opened"
@@ -8908,11 +9339,22 @@ set errorcolor=black          " error message text colour on the bottom line
     def _fb_other_panel(self) -> FileBrowserPanel:
         return self._fb_panels()[1 - self.file_browser.active_panel]
 
+    @staticmethod
+    def _fb_marks_here(panel: FileBrowserPanel) -> List[str]:
+        """The panel's marks that are in its current directory -- the only
+        ones drawn with '*'. Marks made elsewhere stay remembered (and show
+        again on return) but never drive an operation from a directory where
+        the user can't see them: F8 in B used to delete files marked in A."""
+        cwd = os.path.normpath(panel.cwd)
+        return sorted(
+            p for p in panel.selected
+            if os.path.dirname(os.path.normpath(p)) == cwd and os.path.lexists(p)
+        )
+
     def _fb_op_targets(self, panel: FileBrowserPanel) -> List[str]:
-        if panel.selected:
-            paths = sorted(p for p in panel.selected if os.path.lexists(p))
-            if paths:
-                return paths
+        paths = self._fb_marks_here(panel)
+        if paths:
+            return paths
         entry = self._fb_selected_entry()
         if entry and entry.name != "..":
             return [entry.path]
@@ -9115,23 +9557,30 @@ set errorcolor=black          " error message text colour on the bottom line
             except OSError as exc:
                 self._set_error(str(exc))
                 return
-            self._open_hex_view_for_bytes(raw)
+            # F3 is a peek from the browser: label the view with the file
+            # being shown and come back to the browser on close.
+            self._open_hex_view_for_bytes(raw, entry.path, return_mode=Mode.FILE_BROWSER)
             return
         self._open_file_from_path(entry.path)
 
     def _fb_action_edit(self):
+        """F4 / Enter / l / Right. Marked files in this directory are opened
+        if there are any. Otherwise the cursor entry is acted on: a
+        directory is entered -- marking only directories (say, to copy them)
+        used to make every directory refuse to open -- and a file is opened,
+        or refused if directories are marked here (so the marks aren't
+        silently ignored)."""
         panel = self._active_fb_panel()
-        if panel.selected:
-            if self._open_marked_file_browser_entries(panel):
-                return
-            self._set_error("No files in selection (only directories marked)")
+        if self._open_marked_file_browser_entries(panel):
             return
         entry = self._fb_selected_entry()
-        if not entry:
-            return
-        if entry.is_dir:
+        if entry and entry.is_dir:
             self._fb_enter_dir(entry.path)
-        else:
+            return
+        if self._fb_marks_here(panel):
+            self._set_error("No files in selection (only directories marked)")
+            return
+        if entry:
             self._open_file_from_path(entry.path)
 
     def _fb_resolve_dest(self, dest: str, base_cwd: str) -> Tuple[str, bool]:
@@ -9426,10 +9875,33 @@ set errorcolor=black          " error message text colour on the bottom line
                 return i
         return None
 
-    def _fb_pair_paths(self, sources: List[str], dest: str,
-                       into_dir: bool = False) -> Tuple[List[Tuple[str, str]], Optional[str]]:
+    @staticmethod
+    def _fb_is_case_rename(src: str, tgt: str) -> bool:
+        """True when tgt is src itself reached through a case-insensitive
+        filesystem: same directory, same inode, a name differing only in
+        case, and tgt's spelling absent from the directory listing (a
+        distinct hard link would be listed)."""
+        src_dir, src_name = os.path.split(os.path.normpath(src))
+        tgt_dir, tgt_name = os.path.split(os.path.normpath(tgt))
+        if src_name == tgt_name or src_name.casefold() != tgt_name.casefold():
+            return False
+        try:
+            a, b = os.lstat(src), os.lstat(tgt)
+            if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
+                return False
+            if not os.path.samefile(src_dir or ".", tgt_dir or "."):
+                return False
+            return tgt_name not in os.listdir(tgt_dir or ".")
+        except OSError:
+            return False
+
+    def _fb_pair_paths(self, sources: List[str], dest: str, into_dir: bool = False,
+                       op_is_move: bool = False) -> Tuple[List[Tuple[str, str]], Optional[str]]:
         multi = len(sources) > 1
-        is_existing_dir = os.path.isdir(dest) and not os.path.islink(dest)
+        # Follows a symlinked directory: "dl/" where dl -> real_dl means
+        # into real_dl, not "replace the link". Only a single source with no
+        # trailing slash still targets the path itself (as with a real dir).
+        is_existing_dir = os.path.isdir(dest)
         if multi and not is_existing_dir:
             return [], f"Destination must be an existing directory: {dest}"
         for parent in sources:
@@ -9444,7 +9916,8 @@ set errorcolor=black          " error message text colour on the bottom line
             tgt = (os.path.join(dest, self._fb_short_name(src))
                    if treat_as_dir else dest)
             try:
-                if os.path.lexists(tgt) and os.path.samefile(src, tgt):
+                if (os.path.lexists(tgt) and os.path.samefile(src, tgt)
+                        and not (op_is_move and self._fb_is_case_rename(src, tgt))):
                     return [], f"Cannot operate on '{src}' onto itself"
             except OSError:
                 pass
@@ -9563,27 +10036,46 @@ set errorcolor=black          " error message text colour on the bottom line
         (which re-invokes the caller with overwrite=True on 'y')."""
         self.message = ""
         self.message_is_error = False
-        pairs, err = self._fb_pair_paths(sources, dest, into_dir=into_dir)
+        pairs, err = self._fb_pair_paths(sources, dest, into_dir=into_dir,
+                                         op_is_move=op_is_move)
         if err:
             self._set_error(err)
             return None
-        clobbering = [(src, tgt) for src, tgt in pairs if os.path.lexists(tgt)]
+        # A case-only rename "finds" its own source at tgt; that's not a clobber.
+        clobbering = [(src, tgt) for src, tgt in pairs
+                      if os.path.lexists(tgt)
+                      and not (op_is_move and self._fb_is_case_rename(src, tgt))]
         conflict = self._fb_check_buffer_conflicts(clobbering, op_is_move=op_is_move)
         if conflict:
             self._set_error(conflict)
             return None
         if not overwrite:
-            existing = [tgt for _, tgt in pairs if os.path.lexists(tgt)]
+            existing = [tgt for _, tgt in clobbering]
             if existing:
-                count = len(existing)
-                noun = "path" if count == 1 else "paths"
                 self._fb_start_confirm(
                     confirm_kind,
-                    f"Overwrite {count} existing {noun}? [y/N] ",
+                    self._fb_overwrite_label(existing),
                     payload={"sources": sources, "dest": dest, "into_dir": into_dir},
                 )
                 return None
         return pairs
+
+    def _fb_overwrite_label(self, existing: List[str]) -> str:
+        """Overwrite confirmation. An existing directory at a target path is
+        replaced wholesale (its whole tree deleted), not merged into, so say
+        so as plainly as F8's recursive-delete prompt does rather than a
+        bland "Overwrite 1 existing path?"."""
+        dirs = [t for t in existing if os.path.isdir(t) and not os.path.islink(t)]
+        count = len(existing)
+        if count == 1 and dirs:
+            return (f"Replace directory '{self._fb_short_name(dirs[0])}' "
+                    f"and everything in it? [y/N] ")
+        noun = "path" if count == 1 else "paths"
+        label = f"Overwrite {count} existing {noun}"
+        if dirs:
+            label += (f" ({len(dirs)} director{'y' if len(dirs) == 1 else 'ies'}"
+                      f" and everything in {'it' if len(dirs) == 1 else 'them'} deleted)")
+        return label + "? [y/N] "
 
     @staticmethod
     def _fb_copy_one(src: str, tgt: str):
@@ -9595,6 +10087,11 @@ set errorcolor=black          " error message text colour on the bottom line
             shutil.copy2(src, tgt, follow_symlinks=False)
 
     def _fb_move_one(self, src: str, tgt: str):
+        if self._fb_is_case_rename(src, tgt):
+            # tgt *is* src: the backup dance would move the source itself
+            # out of the way. A plain rename just changes the spelling.
+            os.rename(src, tgt)
+            return
         try:
             self._fb_replace_existing_target(tgt, lambda: os.rename(src, tgt))
             return
@@ -9607,8 +10104,7 @@ set errorcolor=black          " error message text colour on the bottom line
         try:
             self._fb_remove_existing_target(src)
         except OSError as exc:
-            self._fb_after_op_refresh(focus_path=tgt)
-            raise OSError(
+            raise _FbSourceCleanupError(
                 f"Complete copy preserved at {tgt}; source cleanup incomplete: {exc}"
             ) from exc
 
@@ -9644,6 +10140,10 @@ set errorcolor=black          " error message text colour on the bottom line
         )
         if pairs is None:
             return
+        # Resolve which buffers each source carries before anything moves:
+        # afterwards a buffer opened through a symlinked alias can no longer
+        # be traced back to the source by its real path.
+        owners = {src: self._fb_buffers_under(src) for src, _ in pairs}
         succeeded = 0
         moved_pairs: List[Tuple[str, str]] = []
         failures: List[Tuple[str, str]] = []
@@ -9654,11 +10154,17 @@ set errorcolor=black          " error message text colour on the bottom line
                 succeeded += 1
                 moved_pairs.append((src, tgt))
                 last_target = tgt
+            except _FbSourceCleanupError as exc:
+                # The data now lives at tgt; follow it there, but still
+                # report the leftover source as a failure.
+                moved_pairs.append((src, tgt))
+                last_target = tgt
+                failures.append((src, str(exc)))
             except (OSError, shutil.Error) as exc:
                 failures.append((src, str(exc)))
         if moved_pairs:
             self._fb_clear_marks_for([s for s, _ in moved_pairs])
-            self._fb_rebind_open_buffers(moved_pairs)
+            self._fb_rebind_open_buffers(moved_pairs, owners)
             self._fb_after_op_refresh(focus_path=last_target)
         self._fb_report_batch_result("Moved", succeeded, failures)
 
@@ -9703,24 +10209,39 @@ set errorcolor=black          " error message text colour on the bottom line
                         f"{idx + 1}/{len(self.buffers)} (close with :bd first)")
         return None
 
-    def _fb_rebind_open_buffers(self, moved_pairs: List[Tuple[str, str]]):
-        for src, tgt in moved_pairs:
-            src_norm = self._normalize_path(src)
-            tgt_norm = self._normalize_path(tgt)
-            if not src_norm or not tgt_norm:
+    def _fb_buffers_under(self, src: str) -> List[Tuple[int, str]]:
+        """(buffer index, path relative to src) for each buffer naming src or
+        something beneath it -- by its path as typed, or by its real path so
+        a buffer opened through a symlinked directory is found too. Must be
+        called before src moves. Hard links are deliberately not matched:
+        another link's name stays valid after src is moved."""
+        src_norm = self._normalize_path(src)
+        if not src_norm:
+            return []
+        # Moving a symlink moves only the alias, never what it points at.
+        src_real = None if os.path.islink(src_norm) else os.path.realpath(src_norm)
+        hits = []
+        for idx, b in enumerate(self.buffers):
+            name = self._normalize_path(b.filename)
+            if not name:
                 continue
-            for idx, b in enumerate(self.buffers):
-                old_name = self._normalize_path(b.filename)
-                if not old_name:
-                    continue
-                if old_name == src_norm:
-                    normalized = tgt_norm
-                elif self._path_is_within(old_name, src_norm):
-                    rel = os.path.relpath(old_name, src_norm)
-                    normalized = os.path.normpath(os.path.join(tgt_norm, rel))
-                else:
-                    continue
-                self._rebind_open_buffer(idx, normalized)
+            if self._path_is_within(name, src_norm):
+                hits.append((idx, os.path.relpath(name, src_norm)))
+            elif src_real is not None:
+                real = os.path.realpath(name)
+                if self._path_is_within(real, src_real):
+                    hits.append((idx, os.path.relpath(real, src_real)))
+        return hits
+
+    def _fb_rebind_open_buffers(self, moved_pairs: List[Tuple[str, str]],
+                                owners: Optional[dict[str, List[Tuple[int, str]]]] = None):
+        for src, tgt in moved_pairs:
+            tgt_norm = self._normalize_path(tgt)
+            if not tgt_norm:
+                continue
+            hits = owners[src] if owners is not None else self._fb_buffers_under(src)
+            for idx, rel in hits:
+                self._rebind_open_buffer(idx, os.path.normpath(os.path.join(tgt_norm, rel)))
 
     def _rebind_open_buffer(self, idx: int, normalized: str):
         new_filename_sig = self._signature_filename(normalized)
@@ -9901,17 +10422,9 @@ set errorcolor=black          " error message text colour on the bottom line
         elif key in (ord("h"), curses.KEY_LEFT, curses.KEY_BACKSPACE, 127, 8):
             self._fb_enter_dir(os.path.dirname(panel.cwd) or panel.cwd)
         elif key in (ord("l"), curses.KEY_RIGHT, *self._ENTER_KEYS):
-            if panel.selected:
-                if self._open_marked_file_browser_entries(panel):
-                    return True
-                self._set_error("No files in selection (only directories marked)")
+            self._fb_action_edit()
+            if self.mode != Mode.FILE_BROWSER:
                 return True
-            entry = self._fb_selected_entry()
-            if entry:
-                if entry.is_dir:
-                    self._fb_enter_dir(entry.path)
-                else:
-                    self._open_file_from_path(entry.path)
         elif key in (curses.KEY_IC, ord(" ")):
             entry = self._fb_selected_entry()
             if entry and entry.name != "..":
@@ -10476,6 +10989,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self.lines = [""]
         self.line_endings = [""]
         self.line_endings_trusted = False
+        self.default_line_ending = self.lnendings_option
         self._saved_signature = self._line_signature(
             self.lines, self.line_endings
         ) + (self.line_endings_trusted, None)
@@ -10712,9 +11226,12 @@ set errorcolor=black          " error message text colour on the bottom line
         end = max(start, end - 1)
 
         if around:
+            # vim's aw takes the trailing white space, and the leading white
+            # space only when there is none after the word (end of line).
+            word_end = end
             while end + 1 < len(line) and line[end + 1].isspace():
                 end += 1
-            if start == col:
+            if end == word_end:
                 while start > 0 and line[start - 1].isspace():
                     start -= 1
 
@@ -11192,12 +11709,12 @@ set errorcolor=black          " error message text colour on the bottom line
 
         if cmd == "le-unix":
             self._set_default_line_endings("unix")
-            self.message = "Default line endings: unix"
+            self.message = "Line endings: unix (written on next :w)"
             return True
 
         if cmd == "le-win":
             self._set_default_line_endings("win")
-            self.message = "Default line endings: windows"
+            self.message = "Line endings: windows (written on next :w)"
             return True
 
         if cmd == "fb":
@@ -11577,7 +12094,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 f"{nu}  tabstop={self.tab_stop}  shiftwidth={self.shift_width}"
                 f"  undolevels={self.max_undo}  {et}  {bk}  {vm}  {mw}"
                 f"  {'intellisense' if self.intellisense else 'nointellisense'}"
-                f"  lnendings={self._default_line_ending_name()}"
+                f"  lnendings={self._default_line_ending_name(self.lnendings_option)}"
                 f"  scrolljump={self.vertical_scroll_jump}"
                 f"  sidescrolljump={self.horizontal_scroll_jump}"
                 f"  sessionfiles={self.session_max_files}"
@@ -11940,8 +12457,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return
         join_col = len(self.lines[self.cursor_row])
         self._push_undo()
-        for _ in range(max(1, cnt - 1)):
-            self._join_line(self.cursor_row)
+        self._join_lines(self.cursor_row, max(1, cnt - 1))
         self._move(self.cursor_row, join_col)
         self.modified = True
 
@@ -12066,54 +12582,51 @@ set errorcolor=black          " error message text colour on the bottom line
 
     def _repeat_visual_toggle_case(
         self, cnt: int, line_span: int = 0, end_col: Optional[int] = None,
-        linewise: bool = False
+        linewise: bool = False, fn: Callable[[str], str] = str.swapcase
     ):
-        # Mirrors _handle_visual's "~" branch: collect only the (row, new
-        # text) pairs that actually differ within [r1, r2], the bounded
-        # span of this one edit. The previous version copied the whole
-        # buffer twice (`before`/`changed_lines`) and then re-scanned every
-        # line to find which ones changed -- three O(n) passes per
-        # dot-repeat regardless of file size, for an edit whose real cost
-        # is proportional to line_span.
+        """Dot-repeat target for visual ~ / u / U / r{char}: rewrite a region
+        shaped like the original selection, starting at the cursor. Only the
+        rows in [r1, r2] are visited, so the cost follows the edit, not the
+        file size."""
         r1 = self.cursor_row
         c1 = self.cursor_col
         r2 = min(len(self.lines) - 1, r1 + max(0, line_span))
-        changes: List[Tuple[int, str]] = []
-        if linewise:
-            for r in range(r1, r2 + 1):
-                new = self.lines[r].swapcase()
-                if new != self.lines[r]:
-                    changes.append((r, new))
-        else:
+        c2 = 0
+        if not linewise:
             raw_c2 = c1 + cnt - 1 if end_col is None else end_col
             if r2 == r1:
                 c2 = max(c1, min(raw_c2, max(0, len(self.lines[r2]) - 1)))
-                ln = self.lines[r1]
-                new = ln[:c1] + ln[c1:c2 + 1].swapcase() + ln[c2 + 1:]
-                if new != ln:
-                    changes.append((r1, new))
             else:
                 c2 = min(raw_c2, max(0, len(self.lines[r2]) - 1))
-                ln = self.lines[r1]
-                new = ln[:c1] + ln[c1:].swapcase()
-                if new != ln:
-                    changes.append((r1, new))
-                for r in range(r1 + 1, r2):
-                    new = self.lines[r].swapcase()
-                    if new != self.lines[r]:
-                        changes.append((r, new))
-                ln = self.lines[r2]
-                new = ln[:c2 + 1].swapcase() + ln[c2 + 1:]
-                if new != ln:
-                    changes.append((r2, new))
-        if changes:
-            self._push_undo()
-            for r, new in changes:
-                self._adjust_marks_for_line_replace(r, self.lines[r], new)
-                self.lines[r] = new
-            self._clamp_marks()
-            self.modified = True
-            self._force_redraw = True
+        self._apply_row_changes(self._visual_text_changes(r1, c1, r2, c2, linewise, fn))
+
+    def _visual_text_changes(self, r1: int, c1: int, r2: int, c2: int, linewise: bool,
+                             fn: Callable[[str], str]) -> List[Tuple[int, str]]:
+        """(row, new text) for each row of the selection [r1,c1]..[r2,c2]
+        that `fn` actually changes; rows it leaves alone are skipped so a
+        no-op costs no undo entry."""
+        changes: List[Tuple[int, str]] = []
+        for r in range(r1, r2 + 1):
+            ln = self.lines[r]
+            start = 0 if linewise or r > r1 else c1
+            stop = len(ln) if linewise or r < r2 else c2 + 1
+            new = ln[:start] + fn(ln[start:stop]) + ln[stop:]
+            if new != ln:
+                changes.append((r, new))
+        return changes
+
+    def _apply_row_changes(self, changes: List[Tuple[int, str]]) -> bool:
+        """Commit _visual_text_changes() output as one undoable edit."""
+        if not changes:
+            return False
+        self._push_undo()
+        for r, new in changes:
+            self._adjust_marks_for_line_replace(r, self.lines[r], new)
+            self.lines[r] = new
+        self._clamp_marks()
+        self.modified = True
+        self._force_redraw = True
+        return True
 
     def _begin_append_after_cursor(self):
         line = self.lines[self.cursor_row]
@@ -12128,25 +12641,59 @@ set errorcolor=black          " error message text colour on the bottom line
         self.cursor_col = len(self.lines[self.cursor_row])
         self._enter_insert()
 
-    def _open_line_below(self):
+    def _open_line_indent(self, auto_indent: bool) -> str:
+        """Leading white space o / O copy from the current line, as Enter does."""
+        if not auto_indent:
+            return ""
+        line = self.lines[self.cursor_row]
+        return line[:len(line) - len(line.lstrip(" \t"))]
+
+    def _open_line_below(self, auto_indent: bool = False):
+        indent = self._open_line_indent(auto_indent)
         self._adjust_marks_for_line_insert(self.cursor_row + 1, 1)
         ending = "" if self.cursor_row + 1 == len(self.lines) else self.default_line_ending
         self._insert_line_endings(self.cursor_row + 1, 1, ending)
-        self.lines.insert(self.cursor_row + 1, "")
+        self.lines.insert(self.cursor_row + 1, indent)
         self._clamp_marks()
         self.cursor_row += 1
-        self.cursor_col = 0
+        self.cursor_col = len(indent)
+        self._note_autoindent(indent)
         self.modified = True
         self._force_redraw = True
 
-    def _open_line_above(self):
+    def _open_line_above(self, auto_indent: bool = False):
+        indent = self._open_line_indent(auto_indent)
         self._adjust_marks_for_line_insert(self.cursor_row, 1)
         self._insert_line_endings(self.cursor_row, 1)
-        self.lines.insert(self.cursor_row, "")
+        self.lines.insert(self.cursor_row, indent)
         self._clamp_marks()
-        self.cursor_col = 0
+        self.cursor_col = len(indent)
+        self._note_autoindent(indent)
         self.modified = True
         self._force_redraw = True
+
+    def _note_autoindent(self, indent: str):
+        """Remember indent just copied onto the cursor row, so it can be
+        dropped again if nothing is typed after it (vim's autoindent)."""
+        self._autoindent_pending = (self.cursor_row, indent) if indent else None
+
+    def _take_unused_autoindent(self, key) -> Optional[str]:
+        """Consume the pending autoindent. On Enter or ESC with nothing typed
+        after it, empty that line again (a whitespace-only line is never what
+        the user meant) and return the indent so Enter can carry it on."""
+        pending, self._autoindent_pending = self._autoindent_pending, None
+        if pending is None or not (key == 27 or key in self._ENTER_KEYS):
+            return None
+        row, indent = pending
+        if (row != self.cursor_row or row >= len(self.lines)
+                or self.lines[row] != indent or self.cursor_col != len(indent)):
+            return None
+        self._adjust_marks_for_same_line_delete(row, 0, len(indent) - 1)
+        self._adjust_replace_overwritten_for_same_line_delete(row, 0, len(indent) - 1)
+        self.lines[row] = ""
+        self.cursor_col = 0
+        self._clamp_marks()
+        return indent
 
     def _repeat_open_line_change(self, above: bool, repeat: int):
         if repeat <= 0:
@@ -12160,18 +12707,18 @@ set errorcolor=black          " error message text colour on the bottom line
 
     def _begin_open_line_below(self):
         self._enter_insert()
-        self._open_line_below()
+        self._open_line_below(auto_indent=True)
 
     def _begin_open_line_above(self):
         self._enter_insert()
-        self._open_line_above()
+        self._open_line_above(auto_indent=True)
 
-    def _toggle_case_range(self, cnt: int):
+    def _toggle_case_range(self, cnt: int, fn: Callable[[str], str] = str.swapcase):
         line = self.lines[self.cursor_row]
         c    = self.cursor_col
         end  = min(c + cnt, len(line))
         if c < len(line):
-            toggled = line[c:end].swapcase()
+            toggled = fn(line[c:end])
             if toggled != line[c:end]:
                 self._push_undo()
                 new_line = line[:c] + toggled + line[end:]
@@ -12185,6 +12732,8 @@ set errorcolor=black          " error message text colour on the bottom line
         """Shared setup for entering INSERT or REPLACE: snapshot undo state
         and reset insert-replay bookkeeping. Caller sets self.mode and any
         mode-specific state afterward."""
+        self._wanted_col = None
+        self._wrap_motion_cursor = None
         self._insert_pre_state = self._snapshot_undo_baseline()
         self._insert_pre_revision = self._content_revision
         self._insert_replay_keys = []
@@ -12193,6 +12742,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._insert_empty_replay = None
         self._insert_repeat_count = 1
         self._block_insert = None
+        self._autoindent_pending = None
 
     def _enter_insert(self):
         self._begin_insert_session(Mode.INSERT)
@@ -12226,9 +12776,9 @@ set errorcolor=black          " error message text colour on the bottom line
                 # For o/O: open a new line for each additional repetition.
                 # For i/a/I/A/R: just continue typing from the current position.
                 if setup == self._begin_open_line_below:
-                    self._open_line_below()
+                    self._open_line_below(auto_indent=True)
                 elif setup == self._begin_open_line_above:
-                    self._open_line_above()
+                    self._open_line_above(auto_indent=True)
                 if mode == Mode.REPLACE:
                     # Each repeat replays its own key sequence from scratch;
                     # without this, a backspace recorded for this iteration
@@ -12263,6 +12813,7 @@ set errorcolor=black          " error message text colour on the bottom line
         )
 
     def _leave_insert(self) -> None:
+        self._take_unused_autoindent(27)
         block_cursor = self._finish_block_insert()
         original_repeat = self._insert_repeat_count
         if (
@@ -12286,10 +12837,12 @@ set errorcolor=black          " error message text colour on the bottom line
             keys = list(self._insert_replay_keys)
             repeat = self._insert_repeat_count
             for _ in range(repeat - 1):
+                if self.mode == Mode.REPLACE:
+                    self._replace_overwritten = []
                 if self._insert_replay_setup == self._begin_open_line_below:
-                    self._open_line_below()
+                    self._open_line_below(auto_indent=True)
                 elif self._insert_replay_setup == self._begin_open_line_above:
-                    self._open_line_above()
+                    self._open_line_above(auto_indent=True)
                 for key in keys:
                     if self.mode == Mode.REPLACE:
                         self._handle_replace_mode(key)
@@ -13490,6 +14043,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._intellisense_completion_index = 0
         self._intellisense_completion_prefix = ""
         self._intellisense_completion_complete = False
+        self._intellisense_completion_context = None
 
     def _line_completion_words(self, line: str) -> Tuple[str, ...]:
         if len(line) > self.MAX_INTELLISENSE_LINE_CHARS:
@@ -13498,16 +14052,22 @@ set errorcolor=black          " error message text colour on the bottom line
             # keystroke with no bound -- skip it instead of blocking, and
             # skip the cache too so its text is never retained as a key.
             return ()
-        cached = self._intellisense_line_words.get(line)
+        # LRU bounded by line characters, large enough to hold a whole scan
+        # window: a smaller cache evicts exactly the rows the next scan
+        # revisits first and never hits.
+        cache = self._intellisense_line_words
+        cached = cache.pop(line, None)
         if cached is None:
             cached = tuple(
                 match.group(0)
                 for match in self._RE_INTELLISENSE_WORD.finditer(line)
             )
-            if len(self._intellisense_line_words) >= 4096:
-                for key in list(self._intellisense_line_words)[:2048]:
-                    del self._intellisense_line_words[key]
-            self._intellisense_line_words[line] = cached
+            self._intellisense_cache_chars += len(line)
+            while cache and self._intellisense_cache_chars > self.INTELLISENSE_WORD_CACHE_CHARS:
+                oldest = next(iter(cache))
+                self._intellisense_cache_chars -= len(oldest)
+                del cache[oldest]
+        cache[line] = cached
         return cached
 
     def _set_intellisense_completion_matches(
@@ -13526,6 +14086,26 @@ set errorcolor=black          " error message text colour on the bottom line
         self.message = ""
         self.message_is_error = False
 
+    def _intellisense_scan_rows(self) -> Iterator[int]:
+        """Row indexes nearest the cursor first, at most
+        MAX_INTELLISENSE_SCAN_LINES of them. The bound keeps typing cost flat
+        on huge buffers; scanning outward (as vim's Ctrl-N does) keeps the
+        words around the edit in range and first in line for the match cap."""
+        n = len(self.lines)
+        cur = max(0, min(self.cursor_row, n - 1))
+        limit = min(n, self.MAX_INTELLISENSE_SCAN_LINES)
+        if limit <= 0:
+            return
+        yield cur
+        emitted = 1
+        for distance in range(1, n):
+            for row in (cur - distance, cur + distance):
+                if 0 <= row < n:
+                    if emitted >= limit:
+                        return
+                    yield row
+                    emitted += 1
+
     def _refresh_intellisense_completion(self):
         if not self.intellisense:
             self._clear_intellisense_completion()
@@ -13535,6 +14115,10 @@ set errorcolor=black          " error message text colour on the bottom line
             self._clear_intellisense_completion()
             return
         start, end, prefix = bounds
+        context = (self.cursor_row, start)
+        if context != self._intellisense_completion_context:
+            self._clear_intellisense_completion()
+        self._intellisense_completion_context = context
         if (
                 self._intellisense_completion_complete
                 and self._intellisense_completion_prefix
@@ -13554,17 +14138,12 @@ set errorcolor=black          " error message text colour on the bottom line
             return
 
         current_row = self.cursor_row
-        current_span = (start, end)
         matches: List[str] = []
         seen = set()
-        complete = True
-        for row, line in enumerate(self.lines):
-            if row >= self.MAX_INTELLISENSE_SCAN_LINES:
-                # Bound the per-keystroke cost on huge buffers: scanning
-                # every line on every keystroke would otherwise make typing
-                # cost grow linearly with file size with no cap.
-                complete = False
-                break
+        # Rows past the scan bound are never seen, so the set isn't exhaustive.
+        complete = len(self.lines) <= self.MAX_INTELLISENSE_SCAN_LINES
+        for row in self._intellisense_scan_rows():
+            line = self.lines[row]
             if row == current_row:
                 if len(line) > self.MAX_INTELLISENSE_LINE_CHARS:
                     # Same bound as _line_completion_words -- the cursor
@@ -13572,12 +14151,12 @@ set errorcolor=black          " error message text colour on the bottom line
                     # comparison), so it needs its own length gate too.
                     words = ()
                 else:
-                    # The word being typed is excluded by exact span, so the
-                    # cursor row needs match positions and skips the word cache.
+                    # Exclude the whole active word, including its suffix
+                    # when the insertion point is in the middle of it.
                     words = (
                         match.group(0)
                         for match in self._RE_INTELLISENSE_WORD.finditer(line)
-                        if match.span() != current_span
+                        if not (match.start() <= start and end <= match.end())
                     )
             else:
                 words = self._line_completion_words(line)
@@ -13682,16 +14261,17 @@ set errorcolor=black          " error message text colour on the bottom line
         return None
 
     def _handle_insert(self, key: Union[int, str]) -> bool:
+        carry_indent = self._take_unused_autoindent(key)
         if key == 27:                                       # ESC
             self._clear_intellisense_completion()
             self._leave_insert()
         elif key == 1:                                      # Ctrl-A
             self._insert_replay_keys.append(key)
-            self.cursor_col = 0
+            self._move_insert_cursor(self.cursor_row, 0)
             self._refresh_intellisense_completion()
         elif key == 5:                                      # Ctrl-E
             self._insert_replay_keys.append(key)
-            self.cursor_col = len(self.lines[self.cursor_row])
+            self._move_insert_cursor(self.cursor_row, len(self.lines[self.cursor_row]))
             self._refresh_intellisense_completion()
         elif key == 14:                                     # Ctrl-N
             self._cycle_intellisense_completion()
@@ -13703,17 +14283,17 @@ set errorcolor=black          " error message text colour on the bottom line
             self._refresh_intellisense_completion()
         elif key in self._ENTER_KEYS:
             self._insert_replay_keys.append(key)
-            self._newline()
+            self._newline(indent=carry_indent)
             self._clear_intellisense_completion()
         elif key is self._PASTE_NEWLINE:
             self._insert_replay_keys.append(key)
             self._newline(auto_indent=False)
             self._clear_intellisense_completion()
-        elif key == ord("\t"):
-            if self._intellisense_completion_matches:
+        elif key == ord("\t") or key is self._INSERT_INDENT:
+            if key is not self._INSERT_INDENT and self._intellisense_completion_matches:
                 self._accept_intellisense_completion()
             else:
-                self._insert_replay_keys.append(key)
+                self._insert_replay_keys.append(self._INSERT_INDENT)
                 self._insert_indent_at_cursor()
                 self._clear_intellisense_completion()
         elif key == curses.KEY_BTAB:
@@ -13738,11 +14318,11 @@ set errorcolor=black          " error message text colour on the bottom line
             self._refresh_intellisense_completion()
         elif key == curses.KEY_HOME:
             self._insert_replay_keys.append(key)
-            self.cursor_col = 0
+            self._move_insert_cursor(self.cursor_row, 0)
             self._refresh_intellisense_completion()
         elif key == curses.KEY_END:
             self._insert_replay_keys.append(key)
-            self.cursor_col = len(self.lines[self.cursor_row])
+            self._move_insert_cursor(self.cursor_row, len(self.lines[self.cursor_row]))
             self._refresh_intellisense_completion()
         elif key == curses.KEY_NPAGE:
             self._insert_replay_keys.append(key)
@@ -13773,18 +14353,23 @@ set errorcolor=black          " error message text colour on the bottom line
         return True
 
     def _handle_replace_mode(self, key: Union[int, str]) -> bool:
+        carry_indent = self._take_unused_autoindent(key)
         if key == 27:
             self._clear_intellisense_completion()
             self._leave_insert()
         elif key == 1:                                      # Ctrl-A
             self._insert_replay_keys.append(key)
-            self.cursor_col = 0
+            self._move_insert_cursor(self.cursor_row, 0)
         elif key == 5:                                      # Ctrl-E
             self._insert_replay_keys.append(key)
-            self.cursor_col = len(self.lines[self.cursor_row])
+            self._move_insert_cursor(self.cursor_row, len(self.lines[self.cursor_row]))
         elif key == ord("\t"):
             self._insert_replay_keys.append(key)
+            row, start = self.cursor_row, self.cursor_col
             self._insert_indent_at_cursor()
+            # Inserted, not overtyped: backspace removes them again.
+            self._replace_overwritten.extend(
+                (row, col, None) for col in range(start, self.cursor_col))
         elif key == curses.KEY_BTAB:
             self._insert_replay_keys.append(key)
             self._detab_before_cursor()
@@ -13805,10 +14390,10 @@ set errorcolor=black          " error message text colour on the bottom line
             self._move_screen_vertical(1)
         elif key == curses.KEY_HOME:
             self._insert_replay_keys.append(key)
-            self.cursor_col = 0
+            self._move_insert_cursor(self.cursor_row, 0)
         elif key == curses.KEY_END:
             self._insert_replay_keys.append(key)
-            self.cursor_col = len(self.lines[self.cursor_row])
+            self._move_insert_cursor(self.cursor_row, len(self.lines[self.cursor_row]))
         elif key == curses.KEY_NPAGE:
             self._insert_replay_keys.append(key)
             self._page_move_keep_col(1)
@@ -13817,31 +14402,13 @@ set errorcolor=black          " error message text colour on the bottom line
             self._page_move_keep_col(-1)
         elif key in self._ENTER_KEYS:
             self._insert_replay_keys.append(key)
-            self._newline()
+            self._replace_newline(indent=carry_indent)
         elif key is self._PASTE_NEWLINE:
             self._insert_replay_keys.append(key)
-            self._newline(auto_indent=False)
+            self._replace_newline(auto_indent=False)
         elif key in (curses.KEY_BACKSPACE, 127, 8):
             self._insert_replay_keys.append(key)
-            if (self._replace_overwritten and
-                    self._replace_overwritten[-1][0] == self.cursor_row and
-                    self._replace_overwritten[-1][1] == self.cursor_col - 1):
-                row, col, original = self._replace_overwritten.pop()
-                if original is None:
-                    # This column was appended past the original end of line —
-                    # nothing to restore, so undo the append instead.
-                    self._adjust_marks_for_same_line_delete(row, col, col)
-                    self._adjust_replace_overwritten_for_same_line_delete(row, col, col)
-                    line = self.lines[row]
-                    self.lines[row] = line[:col] + line[col + 1:]
-                else:
-                    line = self.lines[row]
-                    self.lines[row] = line[:col] + original + line[col + 1:]
-                self._clamp_marks()
-                self.cursor_col = col
-                self.modified = True
-            else:
-                self._backspace()
+            self._replace_backspace()
         elif isinstance(key, PasteSegment) or (isinstance(key, str) and len(key) > 1):
             # A pasted line segment recorded by _replace_pasted_text() for
             # `.`/count-repeat replay -- see the matching branch in
@@ -13910,12 +14477,66 @@ set errorcolor=black          " error message text colour on the bottom line
         for i, segment in enumerate(segments):
             if i > 0:
                 self._insert_replay_keys.append(self._PASTE_NEWLINE)
-                self._newline(auto_indent=False)
+                self._replace_newline(auto_indent=False)
             if segment:
                 self._insert_replay_keys.append(PasteSegment(segment))
                 for ch in segment:
                     self._replace_overwrite_char(ch)
         self._clamp_marks()
+
+    # _replace_overwritten marker: a line break Replace mode inserted, with the
+    # cursor (row, col) it left -- backspace there joins the lines again.
+    _REPLACE_NEWLINE = object()
+
+    def _replace_newline(self, auto_indent: bool = True, indent: Optional[str] = None):
+        self._newline(auto_indent=auto_indent, indent=indent)
+        self._replace_overwritten.append(
+            (self.cursor_row, self.cursor_col, self._REPLACE_NEWLINE))
+
+    def _replace_backspace(self):
+        """Replace mode's backspace (vim's): undo what this session typed --
+        restore an overtyped character, drop an inserted one, rejoin an
+        inserted line break -- and otherwise only move back. Original text
+        the session never touched is never deleted."""
+        row, col = self.cursor_row, self.cursor_col
+        # The most recent change this session made right before the cursor
+        # (positions are kept current as the line shifts).
+        found = next((
+            i for i in range(len(self._replace_overwritten) - 1, -1, -1)
+            if (self._replace_overwritten[i][2] is self._REPLACE_NEWLINE
+                and self._replace_overwritten[i][:2] == (row, col))
+            or (self._replace_overwritten[i][2] is not self._REPLACE_NEWLINE
+                and self._replace_overwritten[i][:2] == (row, col - 1))
+        ), None)
+        top = self._replace_overwritten.pop(found) if found is not None else None
+        if top is not None and top[2] is self._REPLACE_NEWLINE:
+            if col:
+                # The indent the break copied goes with it.
+                self._adjust_marks_for_same_line_delete(row, 0, col - 1)
+                self._adjust_replace_overwritten_for_same_line_delete(row, 0, col - 1)
+                self.lines[row] = self.lines[row][col:]
+                self.cursor_col = 0
+            self._backspace()
+            return
+        if top is not None:
+            original = top[2]
+            line = self.lines[row]
+            if original is None:
+                # Typed past the end of the line (or a Tab's inserted
+                # indent): nothing to restore, so remove it.
+                self._adjust_marks_for_same_line_delete(row, col - 1, col - 1)
+                self._adjust_replace_overwritten_for_same_line_delete(row, col - 1, col - 1)
+                self.lines[row] = line[:col - 1] + line[col:]
+            else:
+                self.lines[row] = line[:col - 1] + original + line[col:]
+            self._clamp_marks()
+            self.cursor_col = col - 1
+            self.modified = True
+            return
+        if col > 0:
+            self._move_insert_cursor(row, col - 1)
+        elif row > 0:
+            self._move_insert_cursor(row - 1, len(self.lines[row - 1]))
 
     def _insert_indent_at_cursor(self):
         self._insert_char(self._indent_str())
@@ -14070,11 +14691,14 @@ set errorcolor=black          " error message text colour on the bottom line
             self.modified       = True
             self._force_redraw  = True
 
-    def _newline(self, auto_indent: bool = True):
+    def _newline(self, auto_indent: bool = True, indent: Optional[str] = None):
         line   = self.lines[self.cursor_row]
         split_row = self.cursor_row
         split_col = self.cursor_col
-        if auto_indent:
+        if indent is not None:
+            # An unused autoindent just cleared off this line carries on.
+            inserted_indent = indent if auto_indent else ""
+        elif auto_indent:
             # Auto-indent: copy leading whitespace
             stripped = line.lstrip(" \t")
             indent = line[:len(line) - len(stripped)]
@@ -14116,6 +14740,8 @@ set errorcolor=black          " error message text colour on the bottom line
         self._clamp_marks()
         self.cursor_row    += 1
         self.cursor_col     = len(inserted_indent)
+        if auto_indent and not line[split_col:]:
+            self._note_autoindent(inserted_indent)
         self.modified       = True
         self._force_redraw  = True
 
@@ -14133,6 +14759,9 @@ set errorcolor=black          " error message text colour on the bottom line
             # key caused the exit.  Off unless :set visualmarks.
             self.marks["<"] = (r1, c1)
             self.marks[">"] = (r2, c2)
+            # The operation that ended the selection may have removed the
+            # rows/columns these name; vim moves them onto what's left.
+            self._clamp_marks()
             self._sync_current_buffer()
         return result
 
@@ -14222,13 +14851,29 @@ set errorcolor=black          " error message text colour on the bottom line
                 self._unknown_pending_command('"', key)
             return True
 
+        if self._pending_op in ("i", "a"):
+            prefix, self._pending_op = self._pending_op, ""
+            ch = self._text_input_char(key)
+            bounds = self._resolve_text_object(prefix == "a", ch) if ch else None
+            if bounds is None:
+                self._unknown_pending_command(prefix, key)
+                return True
+            r1, c1, r2, c2, _ = bounds
+            if self.mode == Mode.VISUAL_LINE:
+                self.mode = Mode.VISUAL    # vim: a word object is charwise
+            self.visual_start = (r1, c1)
+            self._move(r2, c2)
+            return True
+
         if self._pending_op == "r":
             self._pending_op = ""
             ch = self._text_input_char(key)
-            if ch is not None:
+            if ch is not None and self.mode == Mode.VISUAL_BLOCK:
                 r1, r2, vl, vr = self._visual_block_bounds()
                 self.mode = Mode.NORMAL
                 self._block_transform(r1, r2, vl, vr, "r", ch)
+            elif ch is not None:
+                self._visual_rewrite(lambda text, ch=ch: ch * len(text))
             elif key == 27:
                 self._clear_active_register()
                 self.mode = Mode.NORMAL
@@ -14473,57 +15118,15 @@ set errorcolor=black          " error message text colour on the bottom line
                 )
             self.mode = Mode.NORMAL
 
-        elif key == ord("~"):
-            r1, c1, r2, c2 = self._visual_bounds()
-            linewise = (self.mode == Mode.VISUAL_LINE)
-            changes: List[Tuple[int, str]] = []  # (row, new_text)
-            if linewise:
-                for r in range(r1, r2 + 1):
-                    new = self.lines[r].swapcase()
-                    if new != self.lines[r]:
-                        changes.append((r, new))
-            elif r1 == r2:
-                ln = self.lines[r1]
-                new = ln[:c1] + ln[c1:c2 + 1].swapcase() + ln[c2 + 1:]
-                if new != ln:
-                    changes.append((r1, new))
-            else:
-                ln = self.lines[r1]
-                new = ln[:c1] + ln[c1:].swapcase()
-                if new != ln:
-                    changes.append((r1, new))
-                for r in range(r1 + 1, r2):
-                    new = self.lines[r].swapcase()
-                    if new != self.lines[r]:
-                        changes.append((r, new))
-                ln = self.lines[r2]
-                new = ln[:c2 + 1].swapcase() + ln[c2 + 1:]
-                if new != ln:
-                    changes.append((r2, new))
-            if changes:
-                self._push_undo()
-                for r, new in changes:
-                    self._adjust_marks_for_line_replace(r, self.lines[r], new)
-                    self.lines[r] = new
-                self._clamp_marks()
-                self.modified      = True
-                self._force_redraw = True
-                if linewise:
-                    self._set_last_change(
-                        lambda span=r2 - r1:
-                        self._repeat_visual_toggle_case(0, span, linewise=True)
-                    )
-                elif r1 == r2:
-                    self._set_last_change(
-                        lambda cnt=max(0, c2 - c1 + 1):
-                        self._toggle_case_range(cnt)
-                    )
-                else:
-                    self._set_last_change(
-                        lambda span=r2 - r1, end=c2:
-                        self._repeat_visual_toggle_case(0, span, end)
-                    )
-            self.mode          = Mode.NORMAL
+        elif key in self._VISUAL_CASE_FNS:
+            self._visual_rewrite(self._VISUAL_CASE_FNS[key])
+
+        elif key == ord("r"):
+            self._pending_op = "r"
+
+        elif key in (ord("i"), ord("a")):
+            # Text object (iw / aw) -- the next key names it.
+            self._pending_op = chr(key)
 
         elif key == ord("J"):
             r1, c1, r2, c2 = self._visual_bounds()
@@ -14534,8 +15137,7 @@ set errorcolor=black          " error message text colour on the bottom line
             if r1 != r2 or r1 + 1 < len(self.lines):
                 joins = max(r2 - r1, 1)
                 self._push_undo()
-                for _ in range(joins):
-                    self._join_line(r1)
+                self._join_lines(r1, joins)
                 self._move(r1, self._first_nonblank(min(r1, len(self.lines) - 1)))
                 self.modified      = True
                 self._force_redraw = True
@@ -14590,6 +15192,11 @@ set errorcolor=black          " error message text colour on the bottom line
         else:
             self._count_str = ""
             self._pending_op = ""
+            if isinstance(key, int) and 32 <= key <= 126:
+                # The selection stays active, so a silently dropped key
+                # leaves the next one to run as a visual command -- often an
+                # operator. Say so instead.
+                self._unknown_pending_command("", key)
 
         # An armed "<letter> register is meant to persist through selection-
         # extending movement (see test_visual_register_prefix_ignored_for_
@@ -14613,7 +15220,8 @@ set errorcolor=black          " error message text colour on the bottom line
         """Operators with a blockwise meaning in Ctrl-V mode. Returns False
         for keys the shared visual handling covers (> < J : and modes)."""
         if key not in (ord("d"), ord("x"), ord("y"), ord("c"), ord("s"),
-                       ord("I"), ord("A"), ord("r"), ord("~"), ord("p"), ord("P")):
+                       ord("I"), ord("A"), ord("r"), ord("~"), ord("u"), ord("U"),
+                       ord("p"), ord("P")):
             return False
         if key == ord("r"):
             self._pending_op = "r"
@@ -14627,8 +15235,8 @@ set errorcolor=black          " error message text colour on the bottom line
             self._block_delete(r1, r2, vl, vr)
         elif key == ord("y"):
             self._block_yank(r1, r2, vl, vr)
-        elif key == ord("~"):
-            self._block_transform(r1, r2, vl, vr, "~")
+        elif key in (ord("~"), ord("u"), ord("U")):
+            self._block_transform(r1, r2, vl, vr, chr(key))
         else:
             kind = {ord("I"): "I", ord("A"): "A"}.get(key, "c")
             self._block_begin_insert(kind, r1, r2, vl, vr)
@@ -15140,19 +15748,39 @@ set errorcolor=black          " error message text colour on the bottom line
         """Read and return everything up to (not including) the bracketed
         paste's end marker. Called right after the start marker has already
         been consumed by _match_escape_tail()."""
-        chars = []
-        while True:
-            key = self._read_key(stdscr)
-            if key == 27 and self._match_escape_tail(stdscr, self._PASTE_END_TAIL, None):
-                break
-            if key == curses.KEY_RESIZE:
-                self._force_redraw = True
-                continue
-            if isinstance(key, str):
-                chars.append(key)
-            elif isinstance(key, int) and 0 <= key < 0x110000:
-                chars.append(chr(key))
-        return "".join(chars)
+        # Escape sequences inside the payload are text, including those
+        # curses would otherwise translate into function-key integers.
+        stdscr.keypad(False)
+        try:
+            # keypad(False) also sends rmkx to the terminal. Keep its keys
+            # in application mode so an arrow queued behind the paste is
+            # still recognizable after curses decoding is enabled again.
+            try:
+                keypad_xmit = curses.tigetstr("smkx")
+            except curses.error:
+                keypad_xmit = None
+            if keypad_xmit:
+                output_fd = sys.stdout.fileno()
+                while keypad_xmit:
+                    written = os.write(output_fd, keypad_xmit)
+                    if written <= 0:
+                        raise OSError(errno.EIO, "Cannot restore terminal keypad mode")
+                    keypad_xmit = keypad_xmit[written:]
+            chars = []
+            while True:
+                key = self._read_key(stdscr)
+                if key == 27 and self._match_escape_tail(stdscr, self._PASTE_END_TAIL, None):
+                    break
+                if key == curses.KEY_RESIZE:
+                    self._force_redraw = True
+                    continue
+                if isinstance(key, str):
+                    chars.append(key)
+                elif isinstance(key, int) and 0 <= key < 0x110000:
+                    chars.append(chr(key))
+            return "".join(chars)
+        finally:
+            stdscr.keypad(True)
 
     def _handle_bracketed_paste(self, text: str, stdscr) -> bool:
         """Apply a completed bracketed paste. In INSERT/REPLACE mode the
@@ -15194,6 +15822,17 @@ set errorcolor=black          " error message text colour on the bottom line
             self._replace_pasted_text(text)
             return True
         if not self._cmd_buf and self.mode in (Mode.NORMAL, *VISUAL_MODES):
+            # The paste takes the place of whatever command was half-typed:
+            # drop a pending count / f / r / g / "x prefix so none of it
+            # survives to hijack the next keystroke. Visual mode is left the
+            # way ESC leaves it (which also records '< '> under visualmarks).
+            if self.mode in VISUAL_MODES:
+                self._pending_op = ""
+                self._handle_visual(27)
+            self._count_str = ""
+            self._pending_op = ""
+            self._pending_count = 1
+            self._clear_active_register()
             self._paste_literal_outside_insert(text)
             return True
         literal = self._paste_prompt_text(text)
@@ -15242,6 +15881,18 @@ set errorcolor=black          " error message text colour on the bottom line
         self._clamp_cursor()
         self.modified = True
         self._force_redraw = True
+
+    def _reload_if_mapped_file_shrank(self) -> None:
+        """A still-mapped buffer whose file got shorter on disk (truncated,
+        e.g. by logrotate copytruncate) now reads back empty or cut-short
+        lines, and the next edit would bake them in, as would the clean
+        baseline it is compared against. Mapped means unmodified, so
+        reloading loses nothing; do it before the key can edit."""
+        lines = self.lines
+        if not (isinstance(lines, MMapLineStore) and lines.shrunk() and self.filename):
+            return
+        if self._load_file(self.filename):
+            self._set_error(f'"{self.filename}" shrank on disk; reloaded')
 
     def _dispatch_key(self, key: Union[int, str], stdscr) -> bool:
         """Handle one already-read key exactly as the main loop would.
@@ -15385,6 +16036,7 @@ set errorcolor=black          " error message text colour on the bottom line
                         pass
 
                 key = self._read_key(stdscr)
+                self._reload_if_mapped_file_shrank()
 
                 # A lone ESC that turns out to be the start of a terminal
                 # bracketed-paste marker: consume the whole paste here,
