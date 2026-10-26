@@ -10294,7 +10294,8 @@ class VisualModeTests(unittest.TestCase):
 
     def test_block_delete_straddling_wide_char_keeps_outside_cell(self):
         editor = self._tab_block(["中中中中", "abcdefgh"], (1, 1), ["v", 22, "k", "d"])
-        self.assertEqual(editor.lines, [" 中中", "aefgh"])
+        # k keeps the block at screen column 1, inside the first wide glyph.
+        self.assertEqual(editor.lines, [" 中中中", "acdefgh"])
 
     def test_block_insert_and_append_split_a_tab_at_the_block_column(self):
         # Row 1's tab straddles both cell 3 (I) and cell 4 (A).
@@ -12346,17 +12347,19 @@ class NormalModeViFeatureTests(unittest.TestCase):
         self.send(editor, [ord("u")])
         self.assertEqual(editor.marks["a"], (0, 3))
 
-    def test_marks_follow_unicode_case_toggle_expansion(self):
+    def test_case_toggle_keeps_chars_whose_case_form_is_longer(self):
+        # Like vim, ~ maps one character at a time and leaves 'ß' (whose
+        # upper case is 'SS') alone, so the line and its marks never shift.
         editor = ViEditor()
         editor.lines = ["aßb"]
         editor.cursor_col = 2
         self.send(editor, [ord("m"), ord("a")])
 
-        editor.cursor_col = 1
-        self.send(editor, [ord("~")])
+        editor.cursor_col = 0
+        self.send(editor, [ord("3"), ord("~")])
 
-        self.assertEqual(editor.lines, ["aSSb"])
-        self.assertEqual(editor.marks["a"], (0, 3))
+        self.assertEqual(editor.lines, ["AßB"])
+        self.assertEqual(editor.marks["a"], (0, 2))
 
     def test_tilde_toggle_case_matches_str_swapcase_for_titlecase_chars(self):
         # Normal-mode '~' used to toggle case manually via
@@ -12390,20 +12393,24 @@ class NormalModeViFeatureTests(unittest.TestCase):
         self.assertEqual(editor.lines, ["a" + "ǅ".swapcase() + "b"])
         self.assertEqual(editor.lines, ["aǅb"])
 
-    def test_marks_follow_visual_unicode_case_toggle_expansion(self):
-        editor = ViEditor()
-        editor.lines = ["aßb"]
-        editor.cursor_col = 2
-        self.send(editor, [ord("m"), ord("a")])
-        editor.mode = Mode.VISUAL
-        editor.visual_start = (0, 1)
-        editor.cursor_row = 0
-        editor.cursor_col = 1
+    def test_visual_case_change_keeps_chars_whose_case_form_is_longer(self):
+        # 'İ'.lower() is 'i' plus a combining dot, so u leaves it as well.
+        for key, line, want in (("~", "aßb", "AßB"), ("U", "aßb", "AßB"),
+                                ("u", "AİB", "aİb")):
+            with self.subTest(key=key):
+                editor = ViEditor()
+                editor.lines = [line]
+                editor.cursor_col = 2
+                self.send(editor, [ord("m"), ord("a")])
+                editor.mode = Mode.VISUAL
+                editor.visual_start = (0, 0)
+                editor.cursor_row = 0
+                editor.cursor_col = 2
 
-        editor._handle_visual(ord("~"))
+                editor._handle_visual(ord(key))
 
-        self.assertEqual(editor.lines, ["aSSb"])
-        self.assertEqual(editor.marks["a"], (0, 3))
+                self.assertEqual(editor.lines, [want])
+                self.assertEqual(editor.marks["a"], (0, 2))
 
     def test_marks_follow_single_line_put_and_undo(self):
         editor = ViEditor()
@@ -22148,6 +22155,789 @@ class FileBrowserPathTests(unittest.TestCase):
                 self.assertEqual(size(), 2)
                 clock[0] += editor.FB_ENTRIES_MAX_AGE_SECONDS
                 self.assertEqual(size(), 7)
+
+
+class VisualModeReviewRegressionTests(unittest.TestCase):
+    editor = VisualModeCommandTests.editor
+    send = VisualModeCommandTests.send
+
+    class Screen:
+        def __init__(self, height=10, width=80):
+            self.height, self.width = height, width
+            self.calls = []
+
+        def getmaxyx(self):
+            return self.height, self.width
+
+        def move(self, *args):
+            pass
+
+        def clrtoeol(self):
+            pass
+
+        def addstr(self, row, col, text, attr=0):
+            self.calls.append((row, col, text, attr))
+
+        def noutrefresh(self):
+            pass
+
+        def attron(self, *args):
+            pass
+
+        def attroff(self, *args):
+            pass
+
+    def draw(self, editor, screen):
+        with mock.patch("curses.doupdate"):
+            editor.draw(screen)
+
+    def test_mapped_reload_cancels_visual_selection_and_pending_input(self):
+        for enter in (("v",), ("V",), ("v", 22)):
+            for pending in ("", "r", "f", "g", '"a3', "/target"):
+                with self.subTest(enter=enter, pending=pending), tempfile.TemporaryDirectory() as tmp:
+                    path = os.path.join(tmp, "log.txt")
+                    with open(path, "w") as fh:
+                        fh.write("first\nsecond\nthird\nfourth\nfifth\nsixth\n")
+                    editor = self.editor([""])
+                    editor.LARGE_FILE_MMAP_THRESHOLD = 1
+                    self.assertTrue(editor._load_file(path))
+                    try:
+                        editor._move(4, 0)
+                        self.send(editor, *enter, "j", pending)
+                        with open(path, "w") as fh:
+                            fh.write("reset\n")
+                        editor._reload_if_mapped_file_shrank()
+                        self.assertEqual(editor.mode, Mode.NORMAL)
+                        self.assertEqual(editor.visual_start, (0, 0))
+                        self.assertFalse(editor._pending_op)
+                        self.assertFalse(editor._count_str)
+                        self.assertFalse(editor._cmd_buf)
+                        self.assertIsNone(editor.active_register)
+                        self.assertFalse(editor.modified)
+                        self.send(editor, "x")
+                        self.assertEqual(list(editor.lines), ["eset"])
+                        self.send(editor, "u")
+                        self.assertEqual(list(editor.lines), ["reset"])
+                    finally:
+                        if isinstance(editor.lines, MMapLineStore):
+                            editor.lines.close()
+
+    def test_linewise_change_preserves_unselected_blank_row_and_endings(self):
+        for before, row, want in ((["foo", ""], 0, ["X", ""]),
+                                  (["", "foo"], 1, ["", "X"])):
+            for command in ("Vc", "Vs", "vS", "cc"):
+                with self.subTest(before=before, command=command):
+                    editor = self.editor(before, (row, 0))
+                    editor.line_endings = ["\r\n", ""]
+                    editor.marks = {"a": (1 - row, 0)}
+                    editor._mark_clean()
+                    self.send(editor, command, "X", 27)
+                    self.assertEqual(editor.lines, want)
+                    self.assertEqual(editor.line_endings, ["\r\n", ""])
+                    self.assertEqual(editor.marks["a"], (1 - row, 0))
+                    self.assertEqual(len(editor.undo_stack), 1)
+                    self.send(editor, "u")
+                    self.assertEqual(editor.lines, before)
+                    self.assertEqual(editor.line_endings, ["\r\n", ""])
+                    self.send(editor, 18)
+                    self.assertEqual(editor.lines, want)
+
+    def test_linewise_whole_buffer_change_reuses_only_the_placeholder(self):
+        editor = self.editor(["foo", "bar"])
+        self.send(editor, "VjcX", 27)
+        self.assertEqual(editor.lines, ["X"])
+        self.assertEqual(editor.line_endings, [""])
+        self.send(editor, "u")
+        self.assertEqual(editor.lines, ["foo", "bar"])
+
+    def test_block_vertical_motion_keeps_screen_column_through_wide_and_short_rows(self):
+        for middle in ("中abX", "\tX", "", "a"):
+            with self.subTest(middle=middle):
+                editor = self.editor(["abX", middle, "abX"], (0, 2))
+                self.send(editor, "v", 22, "j")
+                self.assertEqual(editor._visual_block_bounds(), (0, 1, 2, 2))
+                self.send(editor, "j")
+                self.assertEqual((editor.cursor_row, editor.cursor_col), (2, 2))
+                self.assertEqual(editor._visual_block_bounds(), (0, 2, 2, 2))
+                self.send(editor, "k")
+                self.assertEqual(editor._visual_block_bounds(), (0, 1, 2, 2))
+                self.send(editor, "k")
+                self.assertEqual((editor.cursor_row, editor.cursor_col), (0, 2))
+
+    def test_block_vertical_delete_only_removes_the_selected_screen_column(self):
+        editor = self.editor(["abX", "中abX"], (0, 2))
+        self.send(editor, "v", 22, "jd")
+        self.assertEqual(editor.lines, ["ab", "中bX"])
+        self.assertEqual(editor.yank_buffer, ["X", "a"])
+        self.send(editor, "u")
+        self.assertEqual(editor.lines, ["abX", "中abX"])
+
+    def test_block_vertical_motion_at_buffer_edge_preserves_full_tab_endpoint(self):
+        editor = self.editor(["abc", "\tX"])
+        self.send(editor, "v", 22, "j0")
+        bounds = editor._visual_block_bounds()
+        self.assertEqual(bounds, (0, 1, 0, 7))
+        self.send(editor, "j")
+        self.assertEqual(editor._visual_block_bounds(), bounds)
+
+    def test_block_corner_swaps_preserve_virtual_endpoints(self):
+        editor = self.editor(["abcde", "\tX", "abcde"], (0, 4))
+        self.send(editor, "v", 22, "j")
+        bounds = editor._visual_block_bounds()
+        for key in ("o", "o", "O", "O"):
+            self.send(editor, key)
+            self.assertEqual(editor._visual_block_bounds(), bounds)
+        self.send(editor, "j")
+        self.assertEqual(editor._visual_block_bounds(), (0, 2, 4, 4))
+
+    def test_block_mode_switch_resets_virtual_columns(self):
+        editor = self.editor(["abX", "\tX", "abcdef"], (0, 2))
+        self.send(editor, "v", 22, "jv", "j")
+        self.assertEqual(editor.mode, Mode.VISUAL)
+        self.assertEqual((editor.cursor_row, editor.cursor_col), (2, 0))
+        self.send(editor, 22, "k")
+        self.assertEqual(editor._visual_block_bounds(), (0, 1, 0, 2))
+
+    def test_block_text_object_replaces_a_virtual_anchor(self):
+        editor = self.editor(["abcdefghi", "\tX"], (0, 5))
+        self.send(editor, "v", 22, "joiw")
+        self.assertEqual(editor._visual_block_bounds(), (0, 0, 0, 8))
+        self.send(editor, "y")
+        self.assertEqual(editor.yank_buffer, ["abcdefghi"])
+
+    def test_block_paging_keeps_display_column(self):
+        for key in (6, curses.KEY_NPAGE, 4, 2, curses.KEY_PPAGE, 21):
+            with self.subTest(key=key):
+                editor = self.editor(["\tX"] * 80)
+                row = 0 if key in (6, curses.KEY_NPAGE, 4) else 79
+                editor.lines[row] = "abX"
+                editor._move(row, 2)
+                self.send(editor, "v", 22, key)
+                self.assertEqual(editor._visual_block_bounds()[2:], (2, 2))
+
+    def test_block_put_tabs_align_suffixes_and_preserve_register(self):
+        editor = self.editor(["ab\tX", "abcdefghX", "12Z", "12Z"], (0, 2))
+        self.send(editor, "v", 22, "jy")
+        self.assertEqual(editor.yank_buffer, ["\t", "cdefgh"])
+        editor._move(2, 2)
+        self.send(editor, "P")
+        self.assertEqual(editor.lines[2:], ["12      Z", "12cdefghZ"])
+        self.assertEqual(editor.yank_buffer, ["\t", "cdefgh"])
+        self.send(editor, "u")
+        self.assertEqual(editor.lines[2:], ["12Z", "12Z"])
+
+    def test_counted_block_put_expands_tabs_once_per_copy(self):
+        editor = self.editor(["12Z", "12Z"], (0, 2))
+        editor._store_register(["\t", "cdefgh"], False, blockwise=True)
+        self.send(editor, "2P")
+        self.assertEqual(editor.lines, ["12" + " " * 12 + "Z", "12cdefghcdefghZ"])
+        self.send(editor, "u")
+        editor._move(0, 1)
+        self.send(editor, "p")
+        self.assertEqual(editor.lines, ["12      Z", "12cdefghZ"])
+
+    def test_block_put_dot_recalculates_tabs_at_new_destination(self):
+        editor = self.editor(["12Z", "12Z", "Z", "Z"], (0, 2))
+        editor._store_register(["\t", "cdefgh"], False, blockwise=True)
+        self.send(editor, "P")
+        editor._move(2, 0)
+        self.send(editor, ".")
+        self.assertEqual(editor.lines[2:], ["        Z", "cdefgh  Z"])
+
+    def test_visual_replacement_with_block_tabs_aligns_rows(self):
+        for enter in (("v",), ("v", 22)):
+            for key in ("p", "P"):
+                with self.subTest(enter=enter, key=key):
+                    editor = self.editor(["12QZ", "12QZ"], (0, 2))
+                    editor._store_register(["\t", "cdefgh"], False, blockwise=True)
+                    self.send(editor, *enter)
+                    if len(enter) == 2:
+                        self.send(editor, "j")
+                    self.send(editor, key)
+                    second = "12cdefghZ" if len(enter) == 2 else "12cdefghQZ"
+                    self.assertEqual(editor.lines, ["12      Z", second])
+
+    def test_destination_tab_expansion_is_included_in_all_block_put_guards(self):
+        for kind in ("normal", "charwise", "block", "repeat"):
+            with self.subTest(kind=kind):
+                editor = self.editor(["aZ", "aZ"], (0, 1))
+                editor.BLOCK_PAD_LIMIT = 20
+                pieces = ["1234567\t", "x"]  # 15 cells at column 1, eight at zero
+                editor._store_register(pieces, False, blockwise=True)
+                if kind == "normal":
+                    self.send(editor, "P")
+                elif kind == "repeat":
+                    editor._repeat_block_replace(pieces, True, 0, 1, 1, 1)
+                else:
+                    self.send(editor, "v")
+                    if kind == "block":
+                        self.send(editor, 22, "j")
+                    self.send(editor, "P")
+                self.assertEqual(editor.lines, ["aZ", "aZ"])
+                self.assertFalse(editor.undo_stack)
+                self.assertFalse(editor.modified)
+                self.assertIn("Block too wide", editor.message)
+
+    def test_word_objects_use_current_punctuation_or_whitespace_run(self):
+        for source, col, want in (("foo.bar", 3, "foobar"),
+                                   ("foo...bar", 4, "foobar"),
+                                   ("foo   bar", 4, "foobar"),
+                                   ("foo \t bar", 4, "foobar"),
+                                   ("foo   ", 4, "foo"),
+                                   ("   ", 1, "")):
+            for command in ("viwd", "diw"):
+                with self.subTest(source=source, command=command):
+                    editor = self.editor([source], (0, col))
+                    self.send(editor, command)
+                    self.assertEqual(editor.lines, [want])
+                    self.send(editor, "u")
+                    self.assertEqual(editor.lines, [source])
+
+    def test_around_word_on_whitespace_takes_adjacent_token(self):
+        for source, col, want in (("foo   bar baz", 4, "foo baz"),
+                                   ("foo   ", 4, ""),
+                                   ("foo... bar", 4, "foobar")):
+            with self.subTest(source=source):
+                editor = self.editor([source], (0, col))
+                self.send(editor, "vawd")
+                self.assertEqual(editor.lines, [want])
+
+    def test_failed_named_visual_put_keeps_register_for_retry(self):
+        for mode in ("v", "V"):
+            for put in ("p", "P"):
+                with self.subTest(mode=mode, put=put):
+                    editor = self.editor(["abcdef"], (0, 1))
+                    editor._store_register(["ZZ"], False)
+                    self.send(editor, mode)
+                    if mode == "v":
+                        self.send(editor, "l")
+                    self.send(editor, '"a', put, put)
+                    self.assertEqual(editor.lines, ["abcdef"])
+                    self.assertEqual(editor.active_register, "a")
+                    self.assertFalse(editor.undo_stack)
+                    editor.registers["a"] = (["A"], False)
+                    self.send(editor, put)
+                    self.assertEqual(editor.lines, ["aAdef"] if mode == "v" else ["A"])
+                    if put == "P":
+                        self.assertEqual(editor.yank_buffer, ["ZZ"])
+
+    def test_partial_tab_block_highlight_matches_actual_cells(self):
+        editor = self.editor(["\tXyz", "abcdefghXyz"], (1, 4))
+        editor.show_line_numbers = False
+        self.send(editor, "v", 22, "k0l")
+        screen = self.Screen(width=20)
+        self.draw(editor, screen)
+        highlighted = [call[:3] for call in screen.calls if call[3] == curses.A_REVERSE]
+        self.assertIn((1, 4, "    X"), highlighted)
+        self.assertIn((2, 4, "efghX"), highlighted)
+        self.assertNotIn((1, 0, "        X"), highlighted)
+        self.send(editor, "d")
+        self.assertEqual(editor.lines, ["    yz", "abcdyz"])
+
+    def test_partial_tab_block_highlight_is_clipped_when_scrolled_or_wrapped(self):
+        for wrapped in (False, True):
+            with self.subTest(wrapped=wrapped):
+                editor = self.editor(["\tXyz", "abcdefghXyz"], (1, 4))
+                editor.show_line_numbers = False
+                if wrapped:
+                    editor.filename = "selection.md"
+                else:
+                    editor.left_col = 6
+                self.send(editor, "v", 22, "k0l")
+                screen = self.Screen(width=6)
+                self.draw(editor, screen)
+                highlighted = [call[:3] for call in screen.calls if call[3] == curses.A_REVERSE]
+                self.assertIn((2 if wrapped else 1, 0, "  X"), highlighted)
+                if wrapped:
+                    self.assertIn((1, 4, "  "), highlighted)
+
+    def test_large_visual_selection_invalidation_tracks_only_visible_rows(self):
+        editor = self.editor(["row"] * 100_000)
+        self.send(editor, "VG")
+        screen = self.Screen()
+        self.draw(editor, screen)
+        visible = set(range(editor.top_line, min(
+            len(editor.lines), editor.top_line + editor._editor_text_rows(screen.height))))
+        self.assertEqual(editor._last_visual_rows, visible)
+        self.assertLessEqual(len(editor._last_visual_rows), screen.height)
+
+    def test_leaving_visual_rows_repaints_old_highlighting(self):
+        editor = self.editor(["alpha", "beta", "gamma"])
+        editor.show_line_numbers = False
+        screen = self.Screen()
+        self.send(editor, "Vj")
+        self.draw(editor, screen)
+        screen.calls.clear()
+        self.send(editor, "k")
+        self.draw(editor, screen)
+        self.assertTrue(any(row == 2 and "beta" in text and not attr & curses.A_REVERSE
+                            for row, _, text, attr in screen.calls))
+        screen.calls.clear()
+        self.send(editor, 27)
+        self.draw(editor, screen)
+        self.assertTrue(any(row == 1 and "alpha" in text and not attr & curses.A_REVERSE
+                            for row, _, text, attr in screen.calls))
+        self.assertFalse(editor._last_visual_rows)
+
+
+class VisualModeFollowupRegressionTests(unittest.TestCase):
+    editor = VisualModeCommandTests.editor
+    send = VisualModeCommandTests.send
+    Screen = MarkdownWrapTests.Screen
+
+    def draw(self, editor, screen):
+        with mock.patch("curses.doupdate"), mock.patch("curses.setsyx") as cursor:
+            editor.draw(screen)
+        return cursor.call_args.args
+
+    def test_block_insert_and_change_skip_leading_short_rows(self):
+        original = ["x", "", "abcdefgh", "xy", "abcdefgh", "tail"]
+        for command in ("I", "c"):
+            with self.subTest(command=command):
+                editor = self.editor(original, (4, 5))
+                editor.marks = {"a": (0, 0), "b": (3, 1)}
+                self.send(editor, "v", 22, "4k", command, "Z", 27)
+                changed = "abcdeZfgh" if command == "I" else "abcdeZgh"
+                want = ["x", "", changed, "xy", changed, "tail"]
+                self.assertEqual(editor.lines, want)
+                self.assertEqual(editor.marks, {"a": (0, 0), "b": (3, 1)})
+                self.assertEqual((editor.cursor_row, editor.cursor_col), (2, 5))
+                self.assertEqual(len(editor.undo_stack), 1)
+                if command == "c":
+                    self.assertEqual(editor.yank_buffer, ["", "", "f", "", "f"])
+                self.send(editor, "u")
+                self.assertEqual(editor.lines, original)
+                self.send(editor, 18)
+                self.assertEqual(editor.lines, want)
+                self.send(editor, "u")
+                editor._move(2, 5)
+                self.send(editor, ".")
+                self.assertEqual(editor.lines, want)
+
+    def test_cancelling_block_insert_after_skipping_short_rows_is_noop(self):
+        editor = self.editor(["x", "abcdefgh", "\tZ"], (1, 5))
+        editor.marks = {"a": (0, 0), "b": (1, 6)}
+        self.send(editor, "v", 22, "kI", 27)
+        self.assertEqual(editor.lines, ["x", "abcdefgh", "\tZ"])
+        self.assertEqual(editor.marks, {"a": (0, 0), "b": (1, 6)})
+        self.assertFalse(editor.modified)
+        self.assertFalse(editor.undo_stack)
+
+    def test_virtual_horizontal_motion_and_delete_keep_requested_cells(self):
+        for keys, bounds, want in (
+            ("h", (1, 2), ["adef", "      X"]),
+            ("l", (2, 3), ["abef", "      X"]),
+            ("2h", (0, 2), ["def", "     X"]),
+            ("2l", (2, 4), ["abf", "     X"]),
+            (curses.KEY_LEFT, (1, 2), ["adef", "      X"]),
+            (curses.KEY_RIGHT, (2, 3), ["abef", "      X"]),
+        ):
+            with self.subTest(keys=keys):
+                editor = self.editor(["abcdef", "\tX"], (0, 2))
+                self.send(editor, "v", 22, "j", keys)
+                self.assertEqual(editor._visual_block_bounds()[2:], bounds)
+                self.send(editor, "d")
+                self.assertEqual(editor.lines, want)
+                self.send(editor, "u")
+                self.assertEqual(editor.lines, ["abcdef", "\tX"])
+
+    def test_virtual_horizontal_motion_survives_short_rows_and_corner_swaps(self):
+        editor = self.editor(["abcdefghij", "x"], (0, 5))
+        self.send(editor, "v", 22, "j3ld")
+        self.assertEqual(editor.lines, ["abcdej", "x"])
+
+        editor = self.editor(["abcdefghi", "\tX"], (0, 2))
+        self.send(editor, "v", 22, "lljOh")
+        self.assertEqual(editor._visual_block_bounds(), (0, 1, 1, 4))
+        self.send(editor, "ok")
+        self.assertEqual(editor._visual_block_bounds(), (0, 1, 1, 4))
+
+    def test_virtual_cursor_draws_at_selected_cell_in_tab_wide_or_short_row(self):
+        for target, column in (("\tX", 2), ("中X", 1), ("x", 5)):
+            with self.subTest(target=target):
+                editor = self.editor(["abcdef", target], (0, column))
+                editor.show_line_numbers = False
+                self.send(editor, "v", 22, "j")
+                self.assertEqual(self.draw(editor, self.Screen(width=20)), (2, column))
+
+    def test_short_row_keeps_virtual_selection_in_horizontal_view(self):
+        editor = self.editor(["a" * 150, "x"], (0, 120))
+        editor.show_line_numbers = False
+        screen = self.Screen(width=20)
+        self.send(editor, "v", 22)
+        self.assertEqual(self.draw(editor, screen), (1, 19))
+        left = editor.left_col
+        self.send(editor, "j")
+        self.assertEqual(self.draw(editor, screen), (2, 19))
+        self.assertEqual(editor.left_col, left)
+        self.assertTrue(any(row == 1 and attr == curses.A_REVERSE
+                            for row, _, _, attr in screen.calls))
+
+    def test_wrapped_virtual_cursor_uses_the_selected_tab_segment(self):
+        editor = self.editor(["abcdefghijklmno", "\tZ"], (0, 9))
+        editor.filename = "selection.md"
+        editor.show_line_numbers = False
+        editor.tab_stop = 16
+        self.send(editor, "v", 22, "j")
+        self.assertEqual(self.draw(editor, self.Screen(height=12, width=6)), (5, 3))
+
+    def test_wrapped_virtual_cursor_can_move_through_blank_cells_after_eol(self):
+        editor = self.editor(["abcdefghijklmnop", "x"], (0, 13))
+        editor.filename = "selection.md"
+        editor.show_line_numbers = False
+        self.send(editor, "v", 22, "j")
+        screen = self.Screen(height=12, width=6)
+        self.assertEqual(self.draw(editor, screen), (6, 1))
+        self.send(editor, curses.KEY_UP)
+        self.assertEqual(self.draw(editor, screen), (5, 1))
+        self.assertEqual(editor._visual_block_bounds()[2:], (7, 13))
+        self.assertEqual(editor.lines, ["abcdefghijklmnop", "x"])
+
+    def test_wrapped_virtual_padding_does_not_allocate_the_whole_gap(self):
+        editor = self.editor(["abcdefghij", "x"], (0, 8))
+        editor.filename = "selection.md"
+        editor.show_line_numbers = False
+        self.send(editor, "v", 22, "j999999l")
+        target = editor._visual_block_bounds()[3]
+        self.assertEqual(target, 1_000_007)
+        tracemalloc.start()
+        try:
+            layout = editor._wrapped_line_layout(1, 6)
+            offset, text = layout[-1]
+            self.assertLessEqual(offset, target)
+            self.assertGreater(offset + len(text), target)
+            self.draw(editor, self.Screen(height=12, width=6))
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 2_000_000)
+        self.assertEqual(editor.lines, ["abcdefghij", "x"])
+        self.send(editor, 27)
+        self.assertEqual(len(editor._wrapped_line_layout(1, 6)), 1)
+        self.assertEqual(self.draw(editor, self.Screen(height=12, width=6)), (1, 0))
+
+    def test_dollar_block_keeps_the_cursor_at_each_line_end(self):
+        editor = self.editor(["abcdefghij", "xy"], (0, 3))
+        editor.show_line_numbers = False
+        self.send(editor, "v", 22, "$j")
+        self.assertEqual(self.draw(editor, self.Screen(width=20)), (2, 1))
+        self.assertEqual(editor._visual_block_bounds()[2:], (3, editor._BLOCK_EOL))
+        self.send(editor, "h")
+        self.assertFalse(editor._block_to_eol)
+        self.assertEqual(editor._visual_block_bounds()[2:], (0, 3))
+
+    def test_line_ending_view_expands_controls_before_clipping_and_coloring(self):
+        editor = self.editor(["a\x01b\x00\x7f\tZ"])
+        editor.line_endings = ["\n"]
+        editor._last_h, editor._last_w = 8, 40
+        editor.le_letter_attr = 12345
+        editor.le_bracket_attr = 54321
+        before = editor._buffer_bytes()
+        screen = self.Screen(height=8, width=40)
+        editor._draw_line_endings_row(screen, 0, 0, 40)
+        self.assertTrue(screen.text(0).startswith("a^Ab^@^?        Z[NL]"))
+        self.assertIn((0, 17, "[", 54321), screen.calls)
+        self.assertEqual(editor._buffer_bytes(), before)
+
+    def test_line_ending_controls_leave_room_for_markers_on_narrow_screen(self):
+        editor = self.editor(["\x01" * 10])
+        editor.line_endings = ["\r\n"]
+        for width in (9, 12, 18):
+            with self.subTest(width=width):
+                line = editor._line_endings_view_line(0, width)
+                self.assertNotIn("\x01", line)
+                self.assertIn("…[CRLF]", line)
+                self.assertLess(editor._display_width(line), width)
+
+    def test_line_ending_view_only_expands_visible_control_prefix(self):
+        editor = self.editor(["\x01" * 500_000])
+        editor.line_endings = ["\n"]
+        tracemalloc.start()
+        try:
+            line = editor._line_endings_view_line(0, 40)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertIn("…[NL]", line)
+        self.assertLess(len(line), 40)
+        self.assertLess(peak, 100_000)
+
+    def test_curses_line_ending_marker_does_not_overwrite_control_adjacent_text(self):
+        child = r'''
+import curses, json, sys
+from test_vi_editor import _editor_with_rc
+
+def run(screen):
+    editor = _editor_with_rc()
+    editor.lines = ["a\x01b"]
+    editor.line_endings = ["\n"]
+    editor._last_h, editor._last_w = 4, 40
+    win = curses.newwin(4, 40, 0, 0)
+    editor._draw_line_endings_row(win, 0, 0, 40)
+    with open(sys.argv[1], "w") as fh:
+        json.dump(win.instr(0, 0).decode().rstrip(), fh)
+
+curses.wrapper(run)
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            result = os.path.join(tmp, "result.json")
+            master, slave = pty.openpty()
+            proc = None
+            output = b""
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, "-c", child, result],
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                    stdin=slave, stdout=slave, stderr=slave,
+                    env=dict(os.environ, TERM="xterm-256color", LINES="24", COLUMNS="80"),
+                )
+            finally:
+                os.close(slave)
+                if proc is None:
+                    os.close(master)
+            try:
+                deadline = time.monotonic() + 10
+                while proc.poll() is None and time.monotonic() < deadline:
+                    ready, _, _ = select.select([master], [], [], 0.1)
+                    if ready:
+                        try:
+                            output += os.read(master, 65536)
+                        except OSError:
+                            break
+                self.assertEqual(proc.wait(timeout=2), 0, repr(output))
+                with open(result) as fh:
+                    self.assertEqual(json.load(fh), "a^Ab[NL]")
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                os.close(master)
+
+    def test_all_block_put_paths_reject_before_normalizing_tabs(self):
+        for kind in ("normal", "charwise", "block", "repeat"):
+            with self.subTest(kind=kind):
+                editor = self.editor(["aZ", "aZ"], (0, 1))
+                editor.BLOCK_PAD_LIMIT = 20
+                pieces = ["1234567\t", "x"]
+                editor.active_register = "a"
+                editor._store_register(pieces, False, blockwise=True)
+                editor._store_register(["U"], False)
+                with mock.patch.object(editor, "_normalized_block_pieces",
+                                       side_effect=AssertionError("expanded before rejection")):
+                    if kind == "normal":
+                        self.send(editor, '"aP')
+                    elif kind == "repeat":
+                        editor._repeat_block_replace(pieces, True, 0, 1, 1, 1)
+                    else:
+                        self.send(editor, "v")
+                        if kind == "block":
+                            self.send(editor, 22, "j")
+                        self.send(editor, '"aP')
+                        self.assertEqual(editor.active_register, "a")
+                self.assertEqual(editor.lines, ["aZ", "aZ"])
+                self.assertFalse(editor.undo_stack)
+                self.assertFalse(editor.modified)
+                self.assertIn("Block too wide", editor.message)
+
+    def test_rejected_tab_payload_uses_bounded_temporary_memory(self):
+        editor = self.editor(["Z"])
+        editor._store_register(["\t" * 1_100_000], False, blockwise=True)
+        tracemalloc.start()
+        try:
+            self.send(editor, "P")
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 1_000_000)
+        self.assertEqual(editor.lines, ["Z"])
+        self.assertIn("Block too wide", editor.message)
+
+    def test_accepted_tab_expansion_does_not_retain_tiny_strings_per_tab(self):
+        editor = self.editor(["Z"])
+        piece = "\t" * 180_000
+        tracemalloc.start()
+        try:
+            normalized = editor._normalized_block_pieces([piece], 0)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(normalized, [" " * 1_440_000])
+        self.assertLess(peak, 6_000_000)
+        self.assertEqual(piece, "\t" * 180_000)
+
+    def test_repeat_after_skipping_short_rows_keeps_the_selected_height(self):
+        original = ["x", "", "abcdefgh", "abcdefgh", "abcdefgh",
+                    "----", "abcdefgh", "abcdefgh", "abcdefgh", "abcdefgh", "abcdefgh"]
+        for command in ("I", "c"):
+            with self.subTest(command=command):
+                editor = self.editor(original, (4, 5))
+                self.send(editor, "v", 22, "4k", command, "Z", 27)
+                changed = "abcdeZfgh" if command == "I" else "abcdeZgh"
+                self.assertEqual(editor.lines[:5], ["x", "", changed, changed, changed])
+                editor._move(6, 5)
+                self.send(editor, ".")
+                self.assertEqual(editor.lines[6:], [changed] * 5)
+                if command == "c":
+                    self.assertEqual(editor.yank_buffer, ["f"] * 5)
+
+    def test_wrapped_screen_motion_keeps_virtual_column_on_short_rows(self):
+        for keys in ((curses.KEY_DOWN,), (curses.KEY_DOWN, curses.KEY_DOWN),
+                     ("2j", curses.KEY_UP)):
+            with self.subTest(keys=keys):
+                editor = self.editor(["abcdefghijklmnop", "x", "abcdefghijklmnop"], (0, 13))
+                editor.filename = "selection.md"
+                editor.show_line_numbers = False
+                screen = self.Screen(height=12, width=40)
+                self.draw(editor, screen)
+                self.send(editor, "v", 22, *keys)
+                self.draw(editor, screen)
+                self.assertEqual(editor._visual_block_bounds()[2:], (13, 13))
+                self.send(editor, "d")
+                self.assertEqual(editor.lines[1], "x")
+                self.assertEqual(editor.lines[0], "abcdefghijklmop")
+
+    def test_wrapped_screen_motion_off_virtual_rows_moves_down(self):
+        editor = self.editor(["a" * 50, "x", "y", "a" * 50], (0, 45))
+        editor.filename = "selection.md"
+        editor.show_line_numbers = False
+        screen = self.Screen(height=16, width=20)
+        self.draw(editor, screen)
+        self.send(editor, "v", 22, "j")
+        rows = [self.draw(editor, screen)[0]]
+        for _ in range(2):
+            self.send(editor, curses.KEY_DOWN)
+            rows.append(self.draw(editor, screen)[0])
+            self.assertEqual(editor._visual_block_bounds()[2:], (45, 45))
+        self.assertEqual(rows, [rows[0], rows[0] + 1, rows[0] + 2])
+        self.assertEqual(editor.cursor_row, 3)
+        self.send(editor, curses.KEY_UP)
+        self.assertEqual(self.draw(editor, screen)[0], rows[0] + 1)
+
+    def virtual_rows_editor(self, lines):
+        editor = self.editor(lines, (0, 45))
+        editor.filename = "selection.md"
+        editor.show_line_numbers = False
+        screen = self.Screen(height=16, width=20)
+        self.draw(editor, screen)
+        self.send(editor, "v", 22, "j")
+        return editor, screen, self.draw(editor, screen)[0]
+
+    def test_counted_up_from_virtual_rows_moves_by_screen_rows(self):
+        editor, screen, start = self.virtual_rows_editor(["a" * 50, "x", "y", "a" * 50])
+        self.send(editor, "3", curses.KEY_UP)
+        self.assertEqual(self.draw(editor, screen)[0], start - 3)
+        self.assertEqual(editor.cursor_row, 0)
+        self.assertEqual(editor._visual_block_bounds()[2:], (45, 45))
+
+    def test_counted_down_from_virtual_rows_keeps_virtual_column(self):
+        editor, screen, _ = self.virtual_rows_editor(["a" * 50, "x", "y", "a" * 50])
+        self.send(editor, "2", curses.KEY_DOWN)
+        self.assertEqual(editor.cursor_row, 3)
+        self.assertEqual(editor._visual_block_bounds()[2:], (45, 45))
+
+    def test_page_scroll_from_virtual_rows_keeps_cursor_screen_row(self):
+        for keys in ((4,), (4, 4), (6,), (curses.KEY_NPAGE,)):
+            with self.subTest(keys=keys):
+                editor, screen, start = self.virtual_rows_editor(["a" * 50] + ["x"] * 40)
+                self.send(editor, *keys)
+                top = (editor.top_line, editor._top_wrap)
+                self.assertEqual(self.draw(editor, screen)[0], start)
+                self.assertEqual((editor.top_line, editor._top_wrap), top)
+
+    def test_block_case_change_keeps_columns_aligned(self):
+        for key in ("U", "~"):
+            with self.subTest(key=key):
+                editor = self.editor(["aßb|", "xyz|"], (0, 0))
+                self.send(editor, "v", 22, "jl", key)
+                self.assertEqual(editor.lines, ["Aßb|", "XYz|"])
+                self.assertEqual([line.index("|") for line in editor.lines], [3, 3])
+
+    def test_block_edit_resolves_syntax_language_once(self):
+        editor = self.editor(["abcdef"] * 50, (0, 0))
+        editor.filename = "notes.txt"
+        with mock.patch.object(editor, "_display_syntax_language",
+                               wraps=editor._display_syntax_language) as lang:
+            self.send(editor, "v", 22, "Gld")
+        self.assertEqual(editor.lines, ["cdef"] * 50)
+        self.assertLessEqual(lang.call_count, 1)
+
+    def test_mutation_language_cache_follows_filename(self):
+        editor = self.editor(["int a;", "int b;"], (0, 0))
+        editor.filename = "notes.txt"
+        editor.lines[0] = "int c;"
+        editor._screen_buf = ["drawn", "drawn"]
+        editor.filename = "main.c"
+        editor.lines[1] = "int d;"
+        self.assertEqual(editor._screen_buf, ["drawn", ""])
+
+
+class ParagraphTextObjectTests(unittest.TestCase):
+    editor = VisualModeCommandTests.editor
+    send = VisualModeCommandTests.send
+    LINES = ["a1", "a2", "", "", "b1", "b2", "  ", "c1"]
+
+    def run_keys(self, cursor, *keys, lines=None):
+        editor = self.editor(list(lines or self.LINES), cursor)
+        self.send(editor, *keys)
+        return editor
+
+    def test_operator_paragraph_objects(self):
+        cases = [
+            ((1, 0), "dip", ["", "", "b1", "b2", "  ", "c1"], ["a1", "a2"]),
+            ((1, 0), "dap", ["b1", "b2", "  ", "c1"], ["a1", "a2", "", ""]),
+            ((2, 0), "dip", ["a1", "a2", "b1", "b2", "  ", "c1"], ["", ""]),
+            ((3, 0), "dap", ["a1", "a2", "  ", "c1"], ["", "", "b1", "b2"]),
+            # No blank lines follow the last paragraph: ap takes those before.
+            ((7, 0), "dap", ["a1", "a2", "", "", "b1", "b2"], ["  ", "c1"]),
+            ((0, 0), "d2ip", ["b1", "b2", "  ", "c1"], ["a1", "a2", "", ""]),
+            ((0, 0), "2dap", ["c1"], ["a1", "a2", "", "", "b1", "b2", "  "]),
+            ((0, 0), "d9ap", [""], self.LINES),
+        ]
+        for cursor, keys, lines, register in cases:
+            with self.subTest(keys=keys, cursor=cursor):
+                editor = self.run_keys(cursor, keys)
+                self.assertEqual(editor.lines, lines)
+                self.assertEqual(editor.yank_buffer, register)
+                self.assertTrue(editor.yank_is_lines)
+
+    def test_yank_change_indent_and_repeat(self):
+        editor = self.run_keys((4, 1), "yip")
+        self.assertEqual(editor.lines, self.LINES)
+        self.assertEqual(editor.yank_buffer, ["b1", "b2"])
+
+        editor = self.run_keys((4, 0), "cipX", 27)
+        self.assertEqual(editor.lines, ["a1", "a2", "", "", "X", "  ", "c1"])
+
+        editor = self.run_keys((0, 0), ">ip")
+        self.assertEqual(editor.lines[:3], ["    a1", "    a2", ""])
+
+        editor = self.run_keys((0, 0), "dap", ".")
+        self.assertEqual(editor.lines, ["c1"])
+
+        editor = self.run_keys((0, 0), "dip", "u")
+        self.assertEqual(editor.lines, self.LINES)
+
+    def test_visual_paragraph_objects_select_lines(self):
+        cases = [
+            ((5, 1), ("vip",), (4, 5)),
+            ((0, 0), ("Vap",), (0, 3)),
+            ((0, 1), ("v", 22, "ip"), (0, 1)),
+            ((0, 0), ("v2ip",), (0, 3)),
+        ]
+        for cursor, keys, rows in cases:
+            with self.subTest(keys=keys):
+                editor = self.run_keys(cursor, *keys)
+                self.assertEqual(editor.mode, Mode.VISUAL_LINE)
+                self.assertEqual((editor.visual_start[0], editor.cursor_row), rows)
+                self.send(editor, "d")
+                self.assertEqual(editor.yank_buffer, self.LINES[rows[0]:rows[1] + 1])
+
+    def test_single_and_empty_buffers(self):
+        editor = self.run_keys((0, 0), "dip", lines=["x"])
+        self.assertEqual(editor.lines, [""])
+        editor = self.run_keys((0, 0), "dap", lines=[""])
+        self.assertEqual(editor.lines, [""])
+        self.assertFalse(editor.modified)
 
 
 if __name__ == "__main__":
