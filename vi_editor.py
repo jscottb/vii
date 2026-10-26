@@ -22,6 +22,7 @@ import fnmatch
 import json
 import base64
 import hashlib
+import io
 import array
 import mmap
 import secrets
@@ -37,7 +38,7 @@ import unicodedata
 import uuid
 from bisect import bisect_left, bisect_right
 from collections import deque, OrderedDict
-from collections.abc import MutableSequence
+from collections.abc import MutableSequence, Sequence
 from typing import Callable, Iterator, List, Tuple, Optional, Union
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -529,6 +530,37 @@ class MMapLineStore(MutableSequence):
             return NotImplemented
 
 
+class _VirtualWrappedLayout(Sequence):
+    """Extend the last wrapped row with virtual cells without storing the gap."""
+
+    def __init__(self, base, text_width: int, cursor_col: int, last_width: int):
+        self.base = base
+        self.text_width = text_width
+        self.cursor_col = cursor_col
+        self.last_width = last_width
+        self.last_index = len(base) - 1
+        self.last_offset = base[-1][0]
+        self.count = self.last_index + (cursor_col - self.last_offset) // text_width + 1
+
+    def __len__(self):
+        return self.count
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(self.count))]
+        if index < 0:
+            index += self.count
+        if not 0 <= index < self.count:
+            raise IndexError(index)
+        if index < self.last_index:
+            return self.base[index]
+        offset = self.last_offset + (index - self.last_index) * self.text_width
+        text = self.base[-1][1] if index == self.last_index else ""
+        width = self.last_width if index == self.last_index else 0
+        needed = min(self.text_width, self.cursor_col + 1 - offset)
+        return offset, text + " " * max(0, needed - width)
+
+
 @dataclass
 class BufferState:
     filename: Optional[str]
@@ -642,6 +674,21 @@ class GotoMotion:
 # (int) for a simple motion, or one of the tagged dataclasses above for a
 # motion that carries extra data.
 OperatorMotion = Union[int, TextObjectMotion, FindMotion, SearchMotion, GotoMotion]
+
+
+def _per_char_case(fn: Callable[[str], str]) -> Callable[[str], str]:
+    """Apply a str case method one character at a time, keeping any
+    character whose mapping is not a single character ('ß'.upper() is 'SS',
+    'İ'.lower() adds a combining dot). Like vim, a case change then never
+    changes a line's length, so block columns and marks stay put."""
+    def apply(text: str) -> str:
+        return "".join(m if len(m := fn(ch)) == 1 else ch for ch in text)
+    return apply
+
+
+_swapcase = _per_char_case(str.swapcase)
+_lowercase = _per_char_case(str.lower)
+_uppercase = _per_char_case(str.upper)
 
 
 # ---------------------------------------------------------------------------
@@ -1104,6 +1151,7 @@ class ViiEditor:
         "  dj dk dG dgg         linewise ranges",
         "  dfX dtX d/pat d?pat  find / search as motion",
         "  diw daw              inner / around word text objects",
+        "  dip dap              inner / around paragraph (linewise)",
         "  2d3w                 operator count × motion count = 6 words",
         "",
         "Yank, Registers, Marks",
@@ -1135,6 +1183,7 @@ class ViiEditor:
         "  ~ u U                toggle case / lowercase / uppercase",
         "  r{char}              replace every selected character with {char}",
         "  iw aw                select inner / around word",
+        "  ip ap                select inner / around paragraph (linewise)",
         "  J                    join selected lines",
         "  p                    replace selection; deleted text becomes new register",
         "  P                    replace selection; register preserved",
@@ -1328,6 +1377,8 @@ class ViiEditor:
         filenames = [filename] if isinstance(filename, str) else list(filename or [])
         first_filename = filenames[0] if filenames else None
         self._buffer_id = object()
+        self._mutation_lang_key: object = None
+        self._mutation_lang_clike = False
         self.filename   = None
         self.lines: Union[List[str], MMapLineStore] = [""]
         self.line_endings: List[str] = [""]
@@ -1445,6 +1496,10 @@ class ViiEditor:
 
         # Visual mode
         self.visual_start: Tuple[int, int] = (0, 0)
+        # Virtual block endpoints survive vertical motion through tabs/short
+        # rows, and corner swaps where no source character occupies the cell.
+        self._block_anchor_extent: Optional[Tuple[int, int]] = None
+        self._block_cursor_extent: Optional[Tuple[int, int]] = None
         # Ctrl-V block extends to the end of every row after `$`.
         self._block_to_eol = False
         # Pending blockwise I/A/c: replicated onto the other rows on ESC.
@@ -2909,7 +2964,14 @@ set errorcolor=black          " error message text colour on the bottom line
         self._breadcrumb_cache_value = []
         self._bracket_match_cache.clear()
         self._content_revision += 1
-        if self._display_syntax_language() in self.CLIKE_LANGUAGES:
+        # Block operations call this once per row; the language only
+        # changes with the file name or log type.
+        lang_key = (self.log_type, self.filename)
+        if self._mutation_lang_key != lang_key:
+            self._mutation_lang_key = lang_key
+            self._mutation_lang_clike = (
+                self._display_syntax_language() in self.CLIKE_LANGUAGES)
+        if self._mutation_lang_clike:
             first_slot = max(0, first_row - self.top_line)
             for slot in range(first_slot, len(self._screen_buf)):
                 self._screen_buf[slot] = ""
@@ -4242,10 +4304,28 @@ set errorcolor=black          " error message text colour on the bottom line
 
     def _move(self, row: int, col: int):
         self._wanted_col = None
+        self._block_cursor_extent = None
         self._wrap_motion_cursor = None
         self.cursor_row = row
         self.cursor_col = col
         self._clamp_cursor()
+
+    def _move_visual_horizontal(self, amount: int):
+        extent = self._block_cursor_extent
+        if self.mode != Mode.VISUAL_BLOCK or extent is None or self._block_to_eol:
+            self._move(self.cursor_row, self.cursor_col + amount)
+            return
+        vcol = max(0, extent[0] + amount)
+        row = self.cursor_row
+        self._move(row, self._col_covering_vcol(self.lines[row], vcol))
+        self._block_cursor_extent = (vcol, vcol)
+        self._wanted_col = vcol
+
+    def _cursor_display_col(self) -> int:
+        if (self.mode == Mode.VISUAL_BLOCK and self._block_cursor_extent is not None
+                and not self._block_to_eol):
+            return self._block_display_col(self.cursor_row, self._block_cursor_extent[0])
+        return self._display_col(self.cursor_row, self.cursor_col)
 
     def _hide_cursor_for_scroll(self):
         """Ask the next draw to run with the terminal cursor hidden.
@@ -4271,6 +4351,18 @@ set errorcolor=black          " error message text colour on the bottom line
             self._move(max(self.cursor_row - text_rows, 0), self.cursor_col)
 
     def _move_vertical(self, row: int):
+        if self.mode == Mode.VISUAL_BLOCK:
+            target = max(0, min(row, len(self.lines) - 1))
+            if target == self.cursor_row:
+                return
+            wanted = self._wanted_col
+            if wanted is None:
+                wanted = (self._block_cursor_extent[0] if self._block_cursor_extent
+                          else self._block_vcol(self.cursor_row, self.cursor_col))
+            self._move(target, self._col_covering_vcol(self.lines[target], wanted))
+            self._wanted_col = wanted
+            self._block_cursor_extent = (wanted, wanted)
+            return
         self._wrap_motion_cursor = None
         if self._wanted_col is None:
             self._wanted_col = self.cursor_col
@@ -4902,7 +4994,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return c2 >= c1
 
     _VISUAL_CASE_FNS: dict = {
-        ord("~"): str.swapcase, ord("u"): str.lower, ord("U"): str.upper,
+        ord("~"): _swapcase, ord("u"): _lowercase, ord("U"): _uppercase,
     }
 
     def _visual_rewrite(self, fn: Callable[[str], str]):
@@ -4930,15 +5022,22 @@ set errorcolor=black          " error message text colour on the bottom line
         self.mode = Mode.NORMAL
 
     def _swap_visual_anchor(self):
+        anchor_extent = self._block_anchor_extent
+        cursor_extent = self._block_cursor_extent
         self.visual_start, current = (self.cursor_row, self.cursor_col), self.visual_start
         self._move(*current)
+        if self.mode == Mode.VISUAL_BLOCK:
+            self._block_anchor_extent = cursor_extent
+            self._block_cursor_extent = anchor_extent
 
     def _replace_visual_selection(self, after: bool, exchange: bool = False):
         if self.mode == Mode.VISUAL and self._pending_put_is_block():
             self._replace_charwise_with_block(exchange)
             return
+        register = self.active_register
         put_buffer, put_is_lines, put_line_endings = self._resolve_put_source()
         if not put_buffer:
+            self.active_register = register
             self.message = "Nothing in register"
             self.message_is_error = True
             self._force_redraw = True
@@ -5055,9 +5154,11 @@ set errorcolor=black          " error message text colour on the bottom line
         # Row r1 keeps its prefix up to vcol; later pieces land on the rows
         # that follow the selection once it is deleted.
         if self._block_pad_refused(r2 + 1, len(pieces) - 1, vcol,
-                                   self._block_payload_cells(pieces)):
+                                   self._block_payload_cells(pieces, vcol)):
             self.active_register = register
             return
+        replay_pieces = list(pieces)
+        pieces = self._normalized_block_pieces(pieces, vcol)
         self.mode = Mode.NORMAL
         self._push_undo()
         deleted = self._delete_range(r1, c1, r2, c2, False)
@@ -5067,7 +5168,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self.modified = True
         self._force_redraw = True
         self._set_last_change(
-            lambda text=list(pieces): self._put_block_payload(text, after=False)
+            lambda text=replay_pieces: self._put_block_payload(text, after=False)
         )
 
     # --- Visual block (Ctrl-V) ---------------------------------------------
@@ -5104,10 +5205,43 @@ set errorcolor=black          " error message text colour on the bottom line
         self._force_redraw = True
         return True
 
-    def _block_payload_cells(self, pieces: List[str]) -> int:
-        """Upper bound on the cells one put of `pieces` inserts: every piece
-        is padded to the widest one when text follows it."""
-        return max((self._display_width(p) for p in pieces), default=0) * len(pieces)
+    def _block_payload_cells(self, pieces: List[str], vcol: int = 0) -> int:
+        """Size padded pieces at their destination without expanding tabs.
+        Stop once the result is already too large for the allocation guard."""
+        width = 0
+        for piece in pieces:
+            if piece.isascii() and "\t" not in piece and "\x00" not in piece:
+                size = len(piece)
+            else:
+                col = vcol
+                for ch in piece:
+                    if ch == "\t":
+                        col += self.tab_stop - col % self.tab_stop
+                    elif ch == "\x00":
+                        col += 2
+                    else:
+                        col += self._char_display_width(ch)
+                    if (col - vcol) * len(pieces) > self.BLOCK_PAD_LIMIT:
+                        return self.BLOCK_PAD_LIMIT + 1
+                size = col - vcol
+            width = max(width, size)
+            if width * len(pieces) > self.BLOCK_PAD_LIMIT:
+                return self.BLOCK_PAD_LIMIT + 1
+        return width * len(pieces)
+
+    def _normalized_block_pieces(self, pieces: List[str], vcol: int) -> List[str]:
+        """Expand accepted payload tabs at their destination before repeating.
+        Register contents themselves retain their original text."""
+        result = []
+        for piece in pieces:
+            if "\t" not in piece:
+                result.append(piece)
+                continue
+            with io.StringIO() as out:
+                for ch, (rendered, _) in zip(piece, self._display_chunks(piece, vcol)):
+                    out.write(rendered if ch == "\t" else ch)
+                result.append(out.getvalue())
+        return result
 
     def _block_vcol(self, row: int, col: int) -> int:
         """Display column where character `col` of `row` starts."""
@@ -5135,12 +5269,29 @@ set errorcolor=black          " error message text colour on the bottom line
             v += width
         return len(line)
 
+    def _col_covering_vcol(self, line: str, vcol: int) -> int:
+        """Index covering a display cell, or len(line) beyond the end."""
+        if line.isascii() and "\t" not in line and "\x00" not in line:
+            return min(max(0, vcol), len(line))
+        v = 0
+        for i, (_, width) in enumerate(self._display_chunks(line, 0)):
+            if width and v + width > vcol:
+                return i
+            v += width
+        return len(line)
+
+    def _block_display_col(self, row: int, vcol: int) -> int:
+        """Map a block boundary to the rendered view without rounding tabs."""
+        col = self._col_covering_vcol(self.lines[row], vcol)
+        return self._display_col(row, col) + vcol - self._block_vcol(row, col)
+
     def _visual_block_bounds(self) -> Tuple[int, int, int, int]:
         """(r1, r2, vl, vr) of the current Ctrl-V selection."""
         ar, ac = self.visual_start
         ar = max(0, min(ar, len(self.lines) - 1))
-        a_first, a_last = self._block_char_extent(ar, ac)
-        c_first, c_last = self._block_char_extent(self.cursor_row, self.cursor_col)
+        a_first, a_last = self._block_anchor_extent or self._block_char_extent(ar, ac)
+        c_first, c_last = (self._block_cursor_extent or
+                           self._block_char_extent(self.cursor_row, self.cursor_col))
         vl = min(a_first, c_first)
         vr = self._BLOCK_EOL if self._block_to_eol else max(a_last, c_last)
         return min(ar, self.cursor_row), max(ar, self.cursor_row), vl, vr
@@ -5316,6 +5467,7 @@ set errorcolor=black          " error message text colour on the bottom line
         past the end of the buffer. Each piece is padded to the block width
         when text follows it, so later columns stay aligned. Returns the
         character column of the insertion on `row`."""
+        # Callers preflight the raw payload and pass normalized pieces here.
         width = max((self._display_width(p) for p in pieces), default=0)
         first_col = 0
         for i, piece in enumerate(pieces):
@@ -5354,18 +5506,18 @@ set errorcolor=black          " error message text colour on the bottom line
             self.message_is_error = True
             return
         count = max(1, count)
-        # Every row is padded to the block width (each extra copy too), so
-        # size the clamp by padded cells, not by the register's raw text.
-        width = max((self._display_width(p) for p in pieces), default=0)
-        unit_size = max(1, width * len(pieces))
         row = self.cursor_row
         if after and self.lines[row]:
             vcol = self._block_char_extent(row, self.cursor_col)[1] + 1
         else:
             vcol = self._block_vcol(row, self.cursor_col)
+        # Include destination-dependent tab expansion in padding/count guards.
+        unit_size = max(1, self._block_payload_cells(pieces, vcol))
         # One copy must fit outright; extra copies are what the count clamp trims.
         if self._block_pad_refused(row, len(pieces), vcol, unit_size):
             return
+        replay_pieces = list(pieces)
+        pieces = self._normalized_block_pieces(pieces, vcol)
         if unit_size * count > self.MAX_COUNT:
             clamped = max(1, self.MAX_COUNT // unit_size)
             if clamped < count:
@@ -5377,7 +5529,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self.modified = True
         self._force_redraw = True
         self._set_last_change(
-            lambda text=list(pieces), after=after, count=count:
+            lambda text=replay_pieces, after=after, count=count:
             self._put_block_payload(text, after, count)
         )
 
@@ -5400,9 +5552,10 @@ set errorcolor=black          " error message text colour on the bottom line
         as_column = src_is_block or (not put_is_lines and len(put_buffer) == 1)
         if as_column:
             pieces = list(put_buffer) if src_is_block else put_buffer * (r2 - r1 + 1)
-            if self._block_pad_refused(r1, len(pieces), vl, self._block_payload_cells(pieces)):
+            if self._block_pad_refused(r1, len(pieces), vl, self._block_payload_cells(pieces, vl)):
                 self.active_register = register
                 return
+            pieces = self._normalized_block_pieces(pieces, vl)
         self.mode = Mode.NORMAL
         self._push_undo()
         deleted = self._block_delete_rows(r1, r2, vl, vr)
@@ -5439,8 +5592,9 @@ set errorcolor=black          " error message text colour on the bottom line
         Single-line text fills however many rows the new block has (fewer
         near the end of the buffer); a block register is put whole."""
         pieces = list(text) if is_block else list(text) * (r2 - r1 + 1)
-        if self._block_pad_refused(r1, len(pieces), vl, self._block_payload_cells(pieces)):
+        if self._block_pad_refused(r1, len(pieces), vl, self._block_payload_cells(pieces, vl)):
             return
+        pieces = self._normalized_block_pieces(pieces, vl)
         self._push_undo()
         self._block_delete_rows(r1, r2, vl, vr)
         self._move(r1, self._put_block_text(pieces, r1, vl))
@@ -5451,24 +5605,37 @@ set errorcolor=black          " error message text colour on the bottom line
         """v_b_O: jump to the other end of the block's current row."""
         ar, ac = self.visual_start
         ar = max(0, min(ar, len(self.lines) - 1))
-        anchor_v = self._block_vcol(ar, ac)
-        cursor_v = self._block_vcol(self.cursor_row, self.cursor_col)
+        anchor_extent = self._block_anchor_extent or self._block_char_extent(ar, ac)
+        cursor_extent = (self._block_cursor_extent or
+                         self._block_char_extent(self.cursor_row, self.cursor_col))
         anchor_line = self.lines[ar]
         self.visual_start = (
-            ar, min(self._col_at_vcol(anchor_line, cursor_v), max(0, len(anchor_line) - 1))
+            ar, min(self._col_covering_vcol(anchor_line, cursor_extent[0]),
+                    max(0, len(anchor_line) - 1))
         )
-        self._move(self.cursor_row, self._col_at_vcol(self.lines[self.cursor_row], anchor_v))
+        self._move(self.cursor_row,
+                   self._col_covering_vcol(self.lines[self.cursor_row], anchor_extent[0]))
+        self._block_anchor_extent = cursor_extent
+        self._block_cursor_extent = anchor_extent
 
     def _block_begin_insert(self, kind: str, r1: int, r2: int, vl: int, vr: int):
         """Start I (before block), A (after block) or c (change block). The
         text typed on the first row is copied onto the rest of the block
         when insert mode ends -- see _finish_block_insert."""
         to_eol = vr == self._BLOCK_EOL
+        height = r2 - r1 + 1
         # A pads the first row now and the rest on ESC (_finish_block_insert);
         # refuse before entering INSERT so nothing is half-done.
         if kind == "A" and not to_eol and self._block_pad_refused(r1, r2 - r1 + 1, vr + 1):
             self._block_rest_cursor(r1, vl)
             return
+        typing_row = r1
+        if kind in ("I", "c"):
+            typing_row = next((row for row in range(r1, r2 + 1)
+                               if self._display_width(self.lines[row]) >= vl), None)
+            if typing_row is None:
+                self._block_rest_cursor(r1, vl)
+                return
         self._enter_insert()
         if kind == "c":
             if self._block_will_change(r1, r2, vl, vr):
@@ -5476,6 +5643,9 @@ set errorcolor=black          " error message text colour on the bottom line
                 self._store_register(deleted, False, blockwise=True)
                 self.modified = True
                 self._force_redraw = True
+        # Preserve the full deleted-register shape, but type and replicate
+        # only from the first row that reaches the selected column.
+        r1 = typing_row
         # Keep preparation separate from a block change's deletion: only
         # tab expansion and padding should be rolled back if nothing is typed.
         before_prepare = self.lines[r1]
@@ -5503,7 +5673,7 @@ set errorcolor=black          " error message text colour on the bottom line
             "nlines": len(self.lines),
         }
         self._insert_replay_setup = (
-            lambda kind=kind, h=r2 - r1 + 1, w=vr - vl + 1, eol=to_eol:
+            lambda kind=kind, h=height, w=vr - vl + 1, eol=to_eol:
             self._block_begin_insert(kind, *self._block_from_cursor(h, w, eol))
         )
 
@@ -5571,13 +5741,14 @@ set errorcolor=black          " error message text colour on the bottom line
         return (r1, col)
 
     def _insert_linewise_change_target(self, row: int, deleted_count: int,
-                                       ending: Optional[str] = None):
+                                       ending: Optional[str] = None, *,
+                                       whole_buffer: bool = False):
         """Create the single replacement line used by linewise change."""
         if deleted_count <= 0:
             return
         if ending is None:
             ending = self.default_line_ending
-        if len(self.lines) == 1 and self.lines[0] == "":
+        if whole_buffer:
             self.line_endings = [ending]
             self._move(0, 0)
             return
@@ -7423,7 +7594,7 @@ set errorcolor=black          " error message text colour on the bottom line
     def _wrap_text_width(self) -> int:
         return max(1, self._last_w - self._line_number_width())
 
-    def _wrapped_line_layout(self, row: int, text_w: int) -> List[Tuple[int, str]]:
+    def _wrapped_line_layout(self, row: int, text_w: int) -> Sequence[Tuple[int, str]]:
         """Display-column offsets and text for soft-wrapped rows; never edit the buffer."""
         text_w = max(1, text_w)
         source = self._display_line_text(row)
@@ -7436,7 +7607,7 @@ set errorcolor=black          " error message text colour on the bottom line
         cached = self._wrap_layout_cache.get(key)
         if cached is not None:
             self._wrap_layout_cache.move_to_end(key)
-            return cached[0]
+            return self._with_virtual_cursor_layout(row, text_w, cached[0])
 
         text = self._display_text_at_col(source, 0)
         ascii_text = text.isascii()
@@ -7477,11 +7648,20 @@ set errorcolor=black          " error message text colour on the bottom line
                 self._wrap_layout_cache_bytes -= old_weight
             self._wrap_layout_cache[key] = (layout, weight)
             self._wrap_layout_cache_bytes += weight
+        return self._with_virtual_cursor_layout(row, text_w, layout)
+
+    def _with_virtual_cursor_layout(self, row: int, text_w: int, layout):
+        if (self.mode == Mode.VISUAL_BLOCK and row == self.cursor_row
+                and self._block_cursor_extent is not None and not self._block_to_eol):
+            dcol = self._cursor_display_col()
+            last_width = self._display_width(layout[-1][1])
+            if dcol >= layout[-1][0] + last_width:
+                return _VirtualWrappedLayout(layout, text_w, dcol, last_width)
         return layout
 
     def _wrapped_cursor_position(self, text_w: int) -> Tuple[int, int]:
         layout = self._wrapped_line_layout(self.cursor_row, text_w)
-        dcol = self._display_col(self.cursor_row, self.cursor_col)
+        dcol = self._cursor_display_col()
         segment = max(0, bisect_right(layout, dcol, key=lambda part: part[0]) - 1)
         return self.cursor_row, segment
 
@@ -7537,6 +7717,15 @@ set errorcolor=black          " error message text colour on the bottom line
         last_col = display_width if allow_eol else max(0, display_width - 1)
         target_col = offset + min(max(0, screen_col), last_col)
         line = self.lines[row]
+        if (self.mode == Mode.VISUAL_BLOCK and not self._block_to_eol
+                and self._markdown_table_layout(row) is None):
+            if segment == len(layout) - 1:
+                # Continue past the line end on virtual cells, as j/k do.
+                target_col = offset + max(0, screen_col)
+            self._move(row, self._col_covering_vcol(line, target_col))
+            self._block_cursor_extent = (target_col, target_col)
+            self._wanted_col = target_col
+            return
         max_col = len(line) if self.mode in (Mode.NORMAL, Mode.INSERT, Mode.REPLACE) else max(0, len(line) - 1)
         # Table padding has no source character. Find the closest editable column.
         if self._markdown_table_layout(row) is not None:
@@ -7564,7 +7753,7 @@ set errorcolor=black          " error message text colour on the bottom line
             col = max(candidates) if direction >= 0 else min(candidates)
         self._move(row, col)
 
-    def _move_screen_vertical(self, amount: int):
+    def _move_screen_vertical(self, amount: int, *, keep_virtual: bool = False):
         if not self._markdown_wrap_enabled():
             self._move_vertical(self.cursor_row + amount)
             return
@@ -7572,11 +7761,22 @@ set errorcolor=black          " error message text colour on the bottom line
         position = self._wrapped_cursor_position(text_w)
         if self._wrap_motion_cursor != (self.cursor_row, self.cursor_col):
             offset = self._wrapped_line_layout(position[0], text_w)[position[1]][0]
-            self._wanted_wrap_col = self._display_col(self.cursor_row, self.cursor_col) - offset
+            self._wanted_wrap_col = self._cursor_display_col() - offset
         wanted = self._wanted_wrap_col
-        self._move_to_wrapped_position(
-            self._advance_wrapped_position(position, amount, text_w), wanted, amount
-        )
+        target = self._advance_wrapped_position(position, amount, text_w)
+        layout = self._wrapped_line_layout(position[0], text_w)
+        if (keep_virtual and amount > 0 and target[0] != position[0]
+                and isinstance(layout, _VirtualWrappedLayout)
+                and position[1] > layout.last_index):
+            # Leaving virtual rows collapses them, so a screen column would
+            # land above the cursor. Keep the virtual column, as j does.
+            # Scrolling leaves keep_virtual off so the cursor holds its row.
+            vcol = self._block_cursor_extent[0]
+            self._move(target[0], self._col_covering_vcol(self.lines[target[0]], vcol))
+            self._block_cursor_extent = (vcol, vcol)
+            self._wanted_col = vcol
+        else:
+            self._move_to_wrapped_position(target, wanted, amount)
         self._wanted_wrap_col = wanted
         self._wrap_motion_cursor = (self.cursor_row, self.cursor_col)
 
@@ -7613,7 +7813,8 @@ set errorcolor=black          " error message text colour on the bottom line
             return False
         text_rows = self._editor_text_rows(self._last_h)
         if key in (curses.KEY_DOWN, curses.KEY_UP):
-            self._move_screen_vertical(count if key == curses.KEY_DOWN else -count)
+            self._move_screen_vertical(count if key == curses.KEY_DOWN else -count,
+                                       keep_virtual=key == curses.KEY_DOWN)
         elif key in (ord("H"), ord("M"), ord("L")):
             screen_row = {
                 ord("H"): count - 1, ord("M"): text_rows // 2, ord("L"): text_rows - 1
@@ -7790,7 +7991,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self.top_line = max(0, self.cursor_row - text_rows + vjump)
 
         # Horizontal
-        dcol = self._display_col(self.cursor_row, self.cursor_col)
+        dcol = self._cursor_display_col()
         if dcol < self.left_col:
             self.left_col = max(0, dcol - hjump + 1)
         elif dcol >= self.left_col + text_w:
@@ -7862,6 +8063,7 @@ set errorcolor=black          " error message text colour on the bottom line
         elif self.mode in VISUAL_MODES:
             v_r1, v_c1, v_r2, v_c2 = self._visual_bounds()
         has_visual = self.mode in VISUAL_MODES
+        visible_visual_rows: set[int] = set()
         marked_rows = {
             row for row, _ in self.marks.values()
             if 0 <= row < len(self.lines)
@@ -7898,6 +8100,8 @@ set errorcolor=black          " error message text colour on the bottom line
                     content += (self.lines[lnum],)
 
             visual_row = has_visual and v_r1 <= lnum <= v_r2
+            if visual_row:
+                visible_visual_rows.add(lnum)
             marked_row = lnum in marked_rows
             mark_state_changed = marked_row or lnum in self._last_marked_rows
             confirm_highlight = (
@@ -7935,10 +8139,13 @@ set errorcolor=black          " error message text colour on the bottom line
                         if self.mode == Mode.VISUAL_LINE:
                             hl_s, hl_e = 0, self._display_width(draw_visible)
                         elif self.mode == Mode.VISUAL_BLOCK:
-                            b_c1, b_c2 = self._block_row_span(lnum, b_vl, b_vr)
-                            hl_s = max(0, self._display_col(lnum, b_c1) - span_offset)
-                            hl_e = min(self._display_width(draw_visible),
-                                       self._display_col(lnum, b_c2) - span_offset)
+                            visible_width = self._display_width(draw_visible)
+                            hl_s = min(visible_width, max(
+                                0, self._block_display_col(lnum, b_vl) - span_offset))
+                            end = (self._display_col(lnum, len(self.lines[lnum]))
+                                   if b_vr == self._BLOCK_EOL
+                                   else self._block_display_col(lnum, b_vr + 1))
+                            hl_e = min(visible_width, max(hl_s, end - span_offset))
                         else:
                             def _dc(r, c):
                                 return self._display_col(r, c) - span_offset
@@ -8024,8 +8231,8 @@ set errorcolor=black          " error message text colour on the bottom line
             fname = f"{fname} [log:{self.log_type}]"
         mod_str  = "[+]" if self.modified else ""
         pct      = int(100 * (self.cursor_row + 1) / len(self.lines))
-        display_col = self._display_col(self.cursor_row, self.cursor_col) + 1
-        pos_col = display_col if self.log_type else self.cursor_col + 1
+        display_col = self._cursor_display_col() + 1
+        pos_col = display_col if self.log_type or self.mode == Mode.VISUAL_BLOCK else self.cursor_col + 1
         pos_str  = f"{self.cursor_row + 1},{pos_col}  {pct}%"
         pending  = self._pending_op + self._count_str
         left_s   = f" {self.mode.value:<7} {mod_str} {fname}"
@@ -8077,14 +8284,14 @@ set errorcolor=black          " error message text colour on the bottom line
 
         # --- Cursor position ---
         srow   = self.cursor_row - self.top_line
-        dcol   = self._display_col(self.cursor_row, self.cursor_col) - self.left_col
+        dcol   = self._cursor_display_col() - self.left_col
         if wrapped:
             cursor_segment = self._wrapped_cursor_position(text_w)[1]
             srow = -1
             for index, (row, segment, offset, _) in enumerate(wrapped_rows):
                 if row == self.cursor_row and segment == cursor_segment:
                     srow = index
-                    dcol = self._display_col(row, self.cursor_col) - offset
+                    dcol = self._cursor_display_col() - offset
                     break
         scol   = dcol + lnum_w
         phys_row: Optional[int] = None
@@ -8108,9 +8315,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._force_redraw = False
         self._last_marked_rows = marked_rows
         self._last_bracket_match_rows = bracket_rows
-        self._last_visual_rows = (
-            set(range(v_r1, v_r2 + 1)) if has_visual else set()
-        )
+        self._last_visual_rows = visible_visual_rows
 
     def _draw_overlay_frame(self, stdscr, height: int, width: int, *,
                             status_left: str, status_right: str,
@@ -8671,12 +8876,30 @@ set errorcolor=black          " error message text colour on the bottom line
         if idx >= len(self.lines):
             return "[NONE]"
         marker = self._line_ending_marker(self._line_ending_for_row(idx))
-        text = self.lines[idx]
-        if width is not None:
-            room = max(0, width - len(marker) - 1)      # last cell left free
-            if self._display_width(text) > room:
-                text = self._display_slice(text, 0, max_width=max(0, room - 1)) + "…"
-        return f"{text}{marker}"
+        # Make curses' control-character expansion explicit before measuring
+        # and splitting marker segments. Stop at the visible prefix so long
+        # control-heavy rows don't need a fully expanded temporary string.
+        room = max(0, width - len(marker) - 1) if width is not None else None
+        col = 0
+        with io.StringIO() as out:
+            for ch in self.lines[idx]:
+                if ch == "\t":
+                    rendered = ch
+                    cells = self.tab_stop - col % self.tab_stop
+                elif ord(ch) < 32 or ord(ch) == 127:
+                    rendered = "^" + chr(ord(ch) ^ 0x40)
+                    cells = 2
+                else:
+                    rendered = ch
+                    cells = self._char_display_width(ch)
+                if room is not None and col + cells > room:
+                    tail = " " * max(0, room - col) if ch == "\t" else rendered
+                    text = self._display_slice(out.getvalue() + tail, 0,
+                                               max_width=max(0, room - 1))
+                    return f"{text}…{marker}"
+                out.write(rendered)
+                col += cells
+            return f"{out.getvalue()}{marker}"
 
     def _save_would_convert_endings(self) -> bool:
         """Whether the next save rewrites endings the file was loaded with
@@ -11201,7 +11424,10 @@ set errorcolor=black          " error message text colour on the bottom line
         col = max(0, min(col, len(self.lines[row]) - 1 if self.lines[row] else 0))
         self._move(row, col if exact else self._first_nonblank(row))
 
-    def _resolve_text_object(self, around: bool, obj: str) -> Optional[Tuple[int, int, int, int, bool]]:
+    def _resolve_text_object(self, around: bool, obj: str,
+                             count: int = 1) -> Optional[Tuple[int, int, int, int, bool]]:
+        if obj == "p":
+            return self._paragraph_object(around, count)
         if obj != "w":
             return None
 
@@ -11210,22 +11436,31 @@ set errorcolor=black          " error message text colour on the bottom line
         if not line:
             return row, 0, row, 0, False
 
-        col = min(self.cursor_col, max(0, len(line) - 1))
-        if col < len(line) and line[col].isspace():
-            while col < len(line) and line[col].isspace():
-                col += 1
-            if col >= len(line):
-                col = max(0, len(line) - 1)
+        col = min(self.cursor_col, len(line) - 1)
 
-        start = col
-        while start > 0 and self._is_word_char(line[start - 1]):
+        def category(ch):
+            if ch.isspace():
+                return 0
+            return 1 if self._is_word_char(ch) else 2
+
+        kind = category(line[col])
+        start = end = col
+        while start > 0 and category(line[start - 1]) == kind:
             start -= 1
-        end = col
-        while end < len(line) and self._is_word_char(line[end]):
+        while end + 1 < len(line) and category(line[end + 1]) == kind:
             end += 1
-        end = max(start, end - 1)
 
-        if around:
+        if around and kind == 0:
+            # Include the next token, or the preceding one at line end.
+            if end + 1 < len(line):
+                next_kind = category(line[end + 1])
+                while end + 1 < len(line) and category(line[end + 1]) == next_kind:
+                    end += 1
+            elif start > 0:
+                prev_kind = category(line[start - 1])
+                while start > 0 and category(line[start - 1]) == prev_kind:
+                    start -= 1
+        elif around:
             # vim's aw takes the trailing white space, and the leading white
             # space only when there is none after the word (end of line).
             word_end = end
@@ -11236,6 +11471,39 @@ set errorcolor=black          " error message text colour on the bottom line
                     start -= 1
 
         return row, start, row, end, False
+
+    def _paragraph_object(self, around: bool, count: int) -> Tuple[int, int, int, int, bool]:
+        """vim's ip / ap, always linewise. A paragraph is a run of non-blank
+        lines, and a run of blank (or whitespace-only) lines counts as one too.
+        ip takes `count` runs from the cursor's; ap takes each paragraph with
+        the blank run after it (or a blank run with the paragraph after it).
+        When ap finds no blank lines after the text, it takes the ones
+        before instead. A count past the buffer end stops at the last line."""
+        lines = self.lines
+        last = len(lines) - 1
+
+        def blank(row: int) -> bool:
+            return not lines[row].strip()
+
+        row = max(0, min(self.cursor_row, last))
+        start_blank = blank(row)
+        start = row
+        while start > 0 and blank(start - 1) == start_blank:
+            start -= 1
+        end = row
+        runs = max(1, count) * (2 if around else 1)
+        for taken in range(runs):
+            if taken:
+                if end == last:
+                    break
+                end += 1
+            kind = blank(end)
+            while end < last and blank(end + 1) == kind:
+                end += 1
+        if around and not start_blank and not blank(end):
+            while start > 0 and blank(start - 1):
+                start -= 1
+        return start, 0, end, len(lines[end]), True
 
     def _find_motion_target(self, cmd: str, char: str, cnt: int) -> Optional[int]:
         line = self.lines[self.cursor_row]
@@ -12582,7 +12850,7 @@ set errorcolor=black          " error message text colour on the bottom line
 
     def _repeat_visual_toggle_case(
         self, cnt: int, line_span: int = 0, end_col: Optional[int] = None,
-        linewise: bool = False, fn: Callable[[str], str] = str.swapcase
+        linewise: bool = False, fn: Callable[[str], str] = _swapcase
     ):
         """Dot-repeat target for visual ~ / u / U / r{char}: rewrite a region
         shaped like the original selection, starting at the cursor. Only the
@@ -12713,7 +12981,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._enter_insert()
         self._open_line_above(auto_indent=True)
 
-    def _toggle_case_range(self, cnt: int, fn: Callable[[str], str] = str.swapcase):
+    def _toggle_case_range(self, cnt: int, fn: Callable[[str], str] = _swapcase):
         line = self.lines[self.cursor_row]
         c    = self.cursor_col
         end  = min(c + cnt, len(line))
@@ -13138,6 +13406,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 else:
                     undo_state = self._capture_undo_state_for_edit()
                 change_row = r1
+                whole_buffer = linewise and r1 == 0 and r2 == len(self.lines) - 1
                 change_ending = self._line_ending_for_row(r2) if linewise else "\n"
                 deleted_endings = self._line_endings_for_range(r1, r2) if linewise else None
                 # _delete_range only ever leaves the buffer untouched in two
@@ -13163,7 +13432,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 if op == "c":
                     if linewise and delete_changed:
                         self._insert_linewise_change_target(
-                            change_row, len(deleted), change_ending
+                            change_row, len(deleted), change_ending, whole_buffer=whole_buffer
                         )
                     self._insert_replay_setup = (
                         lambda op=op, cnt=cnt, key=key:
@@ -13227,7 +13496,7 @@ set errorcolor=black          " error message text colour on the bottom line
 
         # --- text objects: iw / aw ---
         if isinstance(key, TextObjectMotion):
-            bounds = self._resolve_text_object(key.around, key.ch)
+            bounds = self._resolve_text_object(key.around, key.ch, cnt)
             if bounds is not None:
                 apply(*bounds)
             else:
@@ -13876,7 +14145,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 # of swapcase()'s 'ǅ' -> lower() -> 'ǆ'). Visual-mode '~'
                 # and its dot-repeat already use swapcase(); match them so
                 # normal- and visual-mode toggle-case agree on every input.
-                toggled = line[c:end].swapcase()
+                toggled = _swapcase(line[c:end])
                 if toggled != line[c:end]:
                     self._push_undo()
                     old_line = self.lines[self.cursor_row]
@@ -14779,6 +15048,9 @@ set errorcolor=black          " error message text colour on the bottom line
         prev_pending = self._pending_op
         result = self._handle_visual_key_inner(key)
         if self.mode != Mode.VISUAL_BLOCK:
+            self._wanted_col = None
+            self._block_anchor_extent = None
+            self._block_cursor_extent = None
             return result
         if key == ord("$") and not prev_pending:
             self._block_to_eol = True
@@ -14853,15 +15125,20 @@ set errorcolor=black          " error message text colour on the bottom line
 
         if self._pending_op in ("i", "a"):
             prefix, self._pending_op = self._pending_op, ""
+            cnt, self._pending_count = self._pending_count, 1
             ch = self._text_input_char(key)
-            bounds = self._resolve_text_object(prefix == "a", ch) if ch else None
+            bounds = self._resolve_text_object(prefix == "a", ch, cnt) if ch else None
             if bounds is None:
                 self._unknown_pending_command(prefix, key)
                 return True
-            r1, c1, r2, c2, _ = bounds
-            if self.mode == Mode.VISUAL_LINE:
+            r1, c1, r2, c2, linewise = bounds
+            if linewise:
+                self.mode = Mode.VISUAL_LINE    # vim: ip / ap select lines
+                c1 = c2 = 0
+            elif self.mode == Mode.VISUAL_LINE:
                 self.mode = Mode.VISUAL    # vim: a word object is charwise
             self.visual_start = (r1, c1)
+            self._block_anchor_extent = None
             self._move(r2, c2)
             return True
 
@@ -14891,13 +15168,13 @@ set errorcolor=black          " error message text colour on the bottom line
 
         # Movement
         if key == ord("h") or key == curses.KEY_LEFT:
-            self._move(self.cursor_row, self.cursor_col - cnt)
+            self._move_visual_horizontal(-cnt)
         elif key == ord("j") or key == curses.KEY_DOWN:
             self._move_vertical(self.cursor_row + cnt)
         elif key == ord("k") or key == curses.KEY_UP:
             self._move_vertical(self.cursor_row - cnt)
         elif key == ord("l") or key == curses.KEY_RIGHT:
-            self._move(self.cursor_row, self.cursor_col + cnt)
+            self._move_visual_horizontal(cnt)
         elif key == ord("w"):
             self._word_forward(cnt)
         elif key == ord("W"):
@@ -14941,22 +15218,22 @@ set errorcolor=black          " error message text colour on the bottom line
             self._hide_cursor_for_scroll()
             text_rows = self._editor_text_rows(self._last_h)
             self.top_line = min(len(self.lines) - 1, self.top_line + text_rows * cnt)
-            self._move(min(self.cursor_row + text_rows * cnt, len(self.lines) - 1), self.cursor_col)
+            self._move_vertical(self.cursor_row + text_rows * cnt)
         elif key in (2, curses.KEY_PPAGE):
             self._hide_cursor_for_scroll()
             text_rows = self._editor_text_rows(self._last_h)
             self.top_line = max(0, self.top_line - text_rows * cnt)
-            self._move(max(self.cursor_row - text_rows * cnt, 0), self.cursor_col)
+            self._move_vertical(self.cursor_row - text_rows * cnt)
         elif key == 4:
             self._hide_cursor_for_scroll()
             half = max(1, self._editor_text_rows(self._last_h) // 2) * cnt
             self.top_line = min(len(self.lines) - 1, self.top_line + half)
-            self._move(min(self.cursor_row + half, len(self.lines) - 1), self.cursor_col)
+            self._move_vertical(self.cursor_row + half)
         elif key == 21:
             self._hide_cursor_for_scroll()
             half = max(1, self._editor_text_rows(self._last_h) // 2) * cnt
             self.top_line = max(0, self.top_line - half)
-            self._move(max(self.cursor_row - half, 0), self.cursor_col)
+            self._move_vertical(self.cursor_row - half)
         elif key == ord("f"):
             self._pending_count = cnt
             self._pending_op = "f"
@@ -15054,6 +15331,7 @@ set errorcolor=black          " error message text colour on the bottom line
             linewise = (self.mode == Mode.VISUAL_LINE) or key == ord("S")
             self._enter_insert()
             change_row = r1
+            whole_buffer = linewise and r1 == 0 and r2 == len(self.lines) - 1
             change_ending = self._line_ending_for_row(r2) if linewise else "\n"
             deleted_endings = self._line_endings_for_range(r1, r2) if linewise else None
             will_change = self._visual_selection_will_change(r1, c1, r2, c2, linewise)
@@ -15061,7 +15339,9 @@ set errorcolor=black          " error message text colour on the bottom line
                 deleted = self._delete_range(r1, c1, r2, c2, linewise)
                 self._store_register(deleted, linewise, deleted_endings)
                 if linewise:
-                    self._insert_linewise_change_target(change_row, len(deleted), change_ending)
+                    self._insert_linewise_change_target(
+                        change_row, len(deleted), change_ending, whole_buffer=whole_buffer
+                    )
                     nlines = r2 - r1 + 1
                     self._insert_replay_setup = lambda n=nlines: self._begin_substitute_lines(n)
                 elif r1 == r2:
@@ -15125,7 +15405,8 @@ set errorcolor=black          " error message text colour on the bottom line
             self._pending_op = "r"
 
         elif key in (ord("i"), ord("a")):
-            # Text object (iw / aw) -- the next key names it.
+            # Text object (iw aw ip ap) -- the next key names it.
+            self._pending_count = cnt
             self._pending_op = chr(key)
 
         elif key == ord("J"):
@@ -15172,6 +15453,9 @@ set errorcolor=black          " error message text colour on the bottom line
             else:
                 self.mode = Mode.VISUAL_BLOCK
                 self._block_to_eol = False
+                self._wanted_col = None
+                self._block_anchor_extent = None
+                self._block_cursor_extent = None
 
         elif key == ord('"'):
             self._pending_op = '"'
@@ -15892,6 +16176,18 @@ set errorcolor=black          " error message text colour on the bottom line
         if not (isinstance(lines, MMapLineStore) and lines.shrunk() and self.filename):
             return
         if self._load_file(self.filename):
+            if self.mode in VISUAL_MODES:
+                self.mode = Mode.NORMAL
+                self.visual_start = (self.cursor_row, self.cursor_col)
+                self._block_to_eol = False
+                self._wanted_col = None
+                self._block_anchor_extent = None
+                self._block_cursor_extent = None
+                self._pending_op = ""
+                self._pending_count = 1
+                self._count_str = ""
+                self._clear_active_register()
+                self._clear_cmd_buf()
             self._set_error(f'"{self.filename}" shrank on disk; reloaded')
 
     def _dispatch_key(self, key: Union[int, str], stdscr) -> bool:
