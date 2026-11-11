@@ -1,7 +1,13 @@
+#!/usr/bin/env python3
+import base64
+import contextlib
 import curses
 import errno
+import inspect
+import json
 import os
 import pty
+import random
 import select
 import shutil
 import signal
@@ -11,20 +17,29 @@ import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 import typing
 import unittest
+import warnings
 from unittest import mock
-import base64
-import json
-import contextlib
-import inspect
-import random
-import tracemalloc
 
 from vi_editor import (
-    FileBrowserEntry, FindMotion, GotoMotion, GrepResult, MMapLineStore, Mode,
-    SearchMotion, TextObjectMotion, ViEditor,
-    _open_regular_file, _parse_cli_flags, _read_session_filenames, _resolve_project_filenames,
+    FileBrowserEntry,
+    FindMotion,
+    GotoMotion,
+    GrepResult,
+    MMapLineStore,
+    Mode,
+    SearchMotion,
+    TextObjectMotion,
+    ViEditor,
+    _grep_mask_matches,
+    _grep_scan_tree,
+    _grep_split_masks,
+    _open_regular_file,
+    _parse_cli_flags,
+    _read_session_filenames,
+    _resolve_project_filenames,
     _resolve_startup_filenames,
 )
 
@@ -48,19 +63,19 @@ def _editor_with_rc(rc_path: "str | None" = None) -> ViEditor:
         if not os.path.isfile(rc_path):
             self2._write_default_viirc(rc_path)
         try:
-            fh = open(rc_path, encoding="utf-8", errors="replace")
+            with open(rc_path, encoding="utf-8", errors="replace") as fh:
+                rc_lines = fh.readlines()
         except OSError:
             return
-        with fh:
-            for raw in fh:
-                line = raw.split('"', 1)[0].strip()
-                if not line or line.startswith('"'):
-                    continue
-                if line.startswith("set "):
-                    for opt in line[4:].split():
-                        self2._apply_set_opt(opt)
-                elif line.startswith("lnendings="):
-                    self2._apply_set_opt(line)
+        for raw in rc_lines:
+            line = raw.split('"', 1)[0].strip()
+            if not line or line.startswith('"'):
+                continue
+            if line.startswith("set "):
+                for opt in line[4:].split():
+                    self2._apply_set_opt(opt)
+            elif line.startswith("lnendings="):
+                self2._apply_set_opt(line)
 
     ViEditor._load_viirc = patched_load
     try:
@@ -175,11 +190,13 @@ class ExCommandTests(unittest.TestCase):
                     opened_handles.append(handle)
                 return handle
 
-            with mock.patch("vi_editor._open_regular_file", side_effect=spy_open), \
-                 mock.patch("vi_editor.mmap.mmap",
-                            side_effect=OSError("Cannot allocate memory")):
-                with self.assertRaises(OSError):
-                    MMapLineStore(path)
+            with (
+                mock.patch("vi_editor._open_regular_file", side_effect=spy_open),
+                mock.patch("vi_editor.mmap.mmap",
+                           side_effect=OSError("Cannot allocate memory")),
+                self.assertRaises(OSError),
+            ):
+                MMapLineStore(path)
 
             self.assertEqual(len(opened_handles), 1)
             self.assertTrue(opened_handles[0].closed)
@@ -369,9 +386,11 @@ class ExCommandTests(unittest.TestCase):
             editor = ViEditor()
             editor.SESSION_PATH = session_path
 
-            with mock.patch("vi_editor.open", side_effect=OSError("readonly"), create=True):
-                with mock.patch("vi_editor.os.unlink", side_effect=PermissionError("still readonly")):
-                    editor._save_session()
+            with (
+                mock.patch("vi_editor.open", side_effect=OSError("readonly"), create=True),
+                mock.patch("vi_editor.os.unlink", side_effect=PermissionError("still readonly")),
+            ):
+                editor._save_session()
 
     def test_saving_mmap_file_to_itself_materializes_before_truncate(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1093,9 +1112,11 @@ class ExCommandTests(unittest.TestCase):
                 fh.write("old\n")
 
             editor = ViEditor()
-            with mock.patch("vi_editor.os.replace", side_effect=OSError("boom")):
-                with self.assertRaises(OSError):
-                    editor._atomic_write_text(path, "new\n")
+            with (
+                mock.patch("vi_editor.os.replace", side_effect=OSError("boom")),
+                self.assertRaises(OSError),
+            ):
+                editor._atomic_write_text(path, "new\n")
 
             with open(path, "r", encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), "old\n")
@@ -1147,10 +1168,12 @@ class ExCommandTests(unittest.TestCase):
                 closed_fds.append(fd)
                 return real_close(fd)
 
-            with mock.patch("vi_editor.os.fdopen", side_effect=OSError("fdopen failed")):
-                with mock.patch("vi_editor.os.close", side_effect=tracking_close):
-                    with self.assertRaises(OSError):
-                        editor._atomic_write_text(path, "new\n")
+            with (
+                mock.patch("vi_editor.os.fdopen", side_effect=OSError("fdopen failed")),
+                mock.patch("vi_editor.os.close", side_effect=tracking_close),
+                self.assertRaises(OSError),
+            ):
+                editor._atomic_write_text(path, "new\n")
 
             self.assertEqual(len(closed_fds), 1)
             self.assertFalse(os.path.exists(path))
@@ -1187,9 +1210,11 @@ class ExCommandTests(unittest.TestCase):
                     raise RuntimeError("target write failed")
                 return real_atomic_write(target, text, **kwargs)
 
-            with mock.patch.object(editor, "_atomic_write_text", side_effect=fail_target_write):
-                with self.assertRaises(RuntimeError):
-                    editor._save_file(path)
+            with (
+                mock.patch.object(editor, "_atomic_write_text", side_effect=fail_target_write),
+                self.assertRaises(RuntimeError),
+            ):
+                editor._save_file(path)
 
             self.assertFalse(os.path.exists(path))
             self.assertFalse(os.path.exists(backup_dir))
@@ -1248,9 +1273,11 @@ class ExCommandTests(unittest.TestCase):
                     raise RuntimeError("generation failed")
                 return ViEditor._atomic_write_text(editor, target, text, **kwargs)
 
-            with mock.patch.object(editor, "_atomic_write_text", side_effect=fail_generation_write):
-                with self.assertRaises(RuntimeError):
-                    editor._save_file(path)
+            with (
+                mock.patch.object(editor, "_atomic_write_text", side_effect=fail_generation_write),
+                self.assertRaises(RuntimeError),
+            ):
+                editor._save_file(path)
 
             with open(path, "r", encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), "old\n")
@@ -1368,7 +1395,7 @@ class ExCommandTests(unittest.TestCase):
         del editor.LARGE_FILE_MMAP_THRESHOLD
         return editor
 
-    _MMAP_SAMPLES = [
+    _MMAP_SAMPLES: typing.ClassVar[list[bytes]] = [
         b"a", b"a\n", b"a\nb", b"a\r\nb\r\n", b"a\rb\r", b"\n", b"\r\n", b"\r",
         b"\n\n\n", b"a\r\r\nb", b"x\r\n\ry\n\r", b"caf\xc3\xa9\nbad \xff\xfe\n",
         b"tab\there\n\nlast",
@@ -2307,9 +2334,11 @@ class ExCommandTests(unittest.TestCase):
         self.assertEqual(editor.top_line, 0)
 
     def test_unreadable_viirc_does_not_block_startup(self):
-        with mock.patch("vi_editor.os.path.isfile", return_value=True):
-            with mock.patch("builtins.open", side_effect=PermissionError("denied")):
-                editor = ViEditor()
+        with (
+            mock.patch("vi_editor.os.path.isfile", return_value=True),
+            mock.patch("builtins.open", side_effect=PermissionError("denied")),
+        ):
+            editor = ViEditor()
 
         self.assertEqual(editor.lines, [""])
         self.assertFalse(editor.modified)
@@ -5775,9 +5804,11 @@ class ExCommandTests(unittest.TestCase):
         editor.file_browser.op_text = "somewhere"
         editor.file_browser.op_payload = {"sources": ["/nonexistent/src"]}
 
-        with mock.patch("vi_editor.os.getcwd", side_effect=OSError("stale handle")):
-            with mock.patch.object(editor, "_fb_perform_copy") as mock_perform:
-                editor._fb_finish_dest_prompt(editor._fb_perform_copy)
+        with (
+            mock.patch("vi_editor.os.getcwd", side_effect=OSError("stale handle")),
+            mock.patch.object(editor, "_fb_perform_copy") as mock_perform,
+        ):
+            editor._fb_finish_dest_prompt(editor._fb_perform_copy)
 
         mock_perform.assert_called_once()
         # src_cwd fell back to "." rather than propagating the OSError.
@@ -6809,7 +6840,7 @@ class ExCommandTests(unittest.TestCase):
     def test_fb_enter_on_directory_ignores_files_marked_elsewhere(self):
         with tempfile.TemporaryDirectory() as tmp:
             editor = ViEditor()
-            a, b, panel = self._fb_two_dirs_with_marks_in_a(editor, tmp)
+            _a, b, panel = self._fb_two_dirs_with_marks_in_a(editor, tmp)
             os.makedirs(os.path.join(b, "sub"))
             editor._invalidate_fb_entries(panel)
             for i, entry in enumerate(editor._fb_entries(panel)):
@@ -6840,12 +6871,14 @@ class ExCommandTests(unittest.TestCase):
                 status_args.append(right)
                 raise StopDraw
 
-            with mock.patch.object(editor, "_format_status", side_effect=capture), \
-                    mock.patch.object(editor, "_add_curses_text"), \
-                    mock.patch.object(editor, "_bar_windows",
-                                      return_value=(mock.MagicMock(), mock.MagicMock())):
-                with self.assertRaises(StopDraw):
-                    editor._draw_file_browser(mock.MagicMock(), 24, 100)
+            with (
+                mock.patch.object(editor, "_format_status", side_effect=capture),
+                mock.patch.object(editor, "_add_curses_text"),
+                mock.patch.object(editor, "_bar_windows",
+                                  return_value=(mock.MagicMock(), mock.MagicMock())),
+                self.assertRaises(StopDraw),
+            ):
+                editor._draw_file_browser(mock.MagicMock(), 24, 100)
             self.assertIn("  2 marked  ", status_args[0])
 
     def test_fb_open_marked_files_keeps_marks_from_other_directories(self):
@@ -7204,6 +7237,55 @@ class ExCommandTests(unittest.TestCase):
         self.assertIn((1, 0, "a^@b"), screen.calls)
         self.assertIn((1, 3), screen.moves)
 
+    def test_control_chars_render_in_caret_notation_two_cells_wide(self):
+        # curses draws every C0 control and DEL as ^X; counting them as one
+        # cell let a line overflow its row onto the next screen row.
+        editor = ViEditor()
+        editor.show_line_numbers = False
+        editor.lines = ["a\x1bb\x7fc\x01d"]
+
+        visible, content_visible = editor._visible_line_parts(0, 12)
+        self.assertEqual(visible, "a^[b^?c^Ad")
+        self.assertEqual(content_visible, "a^[b^?c^Ad  ")
+        self.assertEqual(editor._display_width(editor.lines[0]), 10)
+        self.assertEqual(editor._display_col(0, 2), 3)
+        self.assertEqual(editor._display_col(0, 4), 6)
+        self.assertEqual(editor._display_slice("a\x1bb", 0, max_width=2), "a^")
+
+    def test_control_char_line_is_clipped_to_screen_width(self):
+        editor = ViEditor()
+        editor.show_line_numbers = False
+        editor.lines = ["\x1b" * 6 + "tail"]
+
+        visible, content_visible = editor._visible_line_parts(0, 10)
+
+        self.assertEqual(editor._display_width(visible), 10)
+        self.assertEqual(visible, "^[^[^[^[^[")
+        self.assertEqual(content_visible, visible)
+
+    def test_unbuildable_patterns_are_invalid_not_crashes_or_warnings(self):
+        # re raises RecursionError for deep nesting and OverflowError for a
+        # huge repeat count, and warns on stderr (over the curses screen)
+        # for "[[".
+        editor = ViEditor()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            self.assertIsNone(editor._compile_pattern("(" * 3000 + ")" * 3000))
+            self.assertIsNone(editor._compile_pattern("a{99999999999999999999}"))
+            self.assertIsNotNone(editor._compile_pattern("[[a]"))
+        editor.lines = ["abc"]
+        editor._execute_cmd("s/" + "(" * 3000 + ")" * 3000 + "/x/")
+        self.assertEqual(editor.lines, ["abc"])
+        self.assertTrue(editor.message.startswith("Invalid pattern"))
+
+    def test_block_columns_count_control_chars_as_two_cells(self):
+        editor = ViEditor()
+        line = "a\x1bbc"
+        self.assertEqual(editor._col_at_vcol(line, 3), 2)
+        self.assertEqual(editor._col_covering_vcol(line, 2), 1)
+        self.assertEqual(editor._line_block_span(line, 3, 3), (2, 3))
+        self.assertEqual(editor._block_payload_cells(["\x1b"]), 2)
+
     def test_visible_line_parts_pad_wide_chars_by_display_width(self):
         editor = ViEditor()
         editor.show_line_numbers = False
@@ -7480,7 +7562,7 @@ class ExCommandTests(unittest.TestCase):
                 pass
 
             def addstr(self, *args):
-                row, col, text = args[:3]
+                _row, col, text = args[:3]
                 if col + len(text) > self.getmaxyx()[1]:
                     raise curses.error("write past edge")
                 self.calls.append(args)
@@ -7707,9 +7789,11 @@ class ExCommandTests(unittest.TestCase):
         editor.cursor_row = 0
 
         screen = FakeScreen()
-        with mock.patch.object(editor, "_current_breadcrumbs", return_value=["class 你x"]):
-            with mock.patch("curses.doupdate"):
-                editor.draw(screen)
+        with (
+            mock.patch.object(editor, "_current_breadcrumbs", return_value=["class 你x"]),
+            mock.patch("curses.doupdate"),
+        ):
+            editor.draw(screen)
 
         breadcrumb_calls = [
             args for args in screen.calls
@@ -10244,8 +10328,8 @@ class VisualModeTests(unittest.TestCase):
 
     # Anchor on the "e" of row 1 (cell 4), cursor on row 0's "X" (cell 8):
     # the block is cells 4..8, and row 0's leading tab covers cells 0..7.
-    _PARTIAL_TAB_LINES = ["\tXyz", "abcdefghXyz"]
-    _PARTIAL_TAB_KEYS = ["v", 22, "k", "0", "l"]
+    _PARTIAL_TAB_LINES: typing.ClassVar[list[str]] = ["\tXyz", "abcdefghXyz"]
+    _PARTIAL_TAB_KEYS: typing.ClassVar[list[str | int]] = ["v", 22, "k", "0", "l"]
 
     def test_block_delete_keeps_cells_of_a_tab_left_of_the_block(self):
         editor = self._tab_block(self._PARTIAL_TAB_LINES, (1, 4), self._PARTIAL_TAB_KEYS)
@@ -10892,8 +10976,8 @@ class NormalModeViFeatureTests(unittest.TestCase):
         # it directly here.
         insert_hints = typing.get_type_hints(ViEditor._handle_insert)
         replace_hints = typing.get_type_hints(ViEditor._handle_replace_mode)
-        self.assertEqual(insert_hints["key"], typing.Union[int, str])
-        self.assertEqual(replace_hints["key"], typing.Union[int, str])
+        self.assertEqual(insert_hints["key"], int | str)
+        self.assertEqual(replace_hints["key"], int | str)
 
     def test_counted_replace_mode_replays_wide_unicode_text(self):
         editor = ViEditor()
@@ -12897,7 +12981,9 @@ class NormalModeViFeatureTests(unittest.TestCase):
 
         self.assertEqual(editor.lines, ["one", "", "", "", "two", "", "", ""])
 
-    def test_dot_repeats_insert_mode_cursor_movement_within_change(self):
+    def test_cursor_key_in_insert_starts_a_new_change(self):
+        # Like vim, moving the cursor ends the insert for `.` and undo:
+        # `.` repeats only the text typed after the move, at the cursor.
         editor = ViEditor()
         editor.lines = ["abc"]
         editor.cursor_col = 1
@@ -12907,8 +12993,14 @@ class NormalModeViFeatureTests(unittest.TestCase):
 
         editor.cursor_col = len(editor.lines[0]) - 1
         self.send(editor, [ord(".")])
+        self.assertEqual(editor.lines, ["aYXbYc"])
 
-        self.assertEqual(editor.lines, ["aYXbYXc"])
+        self.send(editor, [ord("u")])
+        self.assertEqual(editor.lines, ["aYXbc"])
+        self.send(editor, [ord("u")])
+        self.assertEqual(editor.lines, ["aXbc"])
+        self.send(editor, [ord("u")])
+        self.assertEqual(editor.lines, ["abc"])
 
     def test_dot_repeats_insert_mode_noop_delete_keys_when_later_text_changes(self):
         editor = ViEditor()
@@ -12989,7 +13081,7 @@ class NormalModeViFeatureTests(unittest.TestCase):
         self.send(editor, [ord(".")])
         self.assertEqual(editor.lines, ["X", "one", "X", "two"])
 
-    def test_dot_repeats_replace_mode_cursor_movement_within_change(self):
+    def test_dot_after_replace_mode_cursor_movement_repeats_later_text(self):
         editor = ViEditor()
         editor.lines = ["abcde"]
         editor.cursor_col = 1
@@ -14162,7 +14254,7 @@ class HexModeTests(unittest.TestCase):
         editor.lines = ["caf\xe9"]
         editor.line_endings = ["\n"]
         editor._execute_cmd(":hex")
-        self.assertEqual(editor._hex_cached_data, "caf\xe9\n".encode("utf-8"))
+        self.assertEqual(editor._hex_cached_data, "caf\xe9\n".encode())
 
     # --- F3 hex view is labelled with its file and returns to the browser ---
 
@@ -14806,16 +14898,18 @@ class InputHandlingTests(unittest.TestCase):
         editor._handle_replace_mode(curses.KEY_PPAGE)
         self.assertEqual(editor.cursor_row, 0)
 
-    def test_page_keys_are_recorded_for_insert_replay(self):
+    def test_page_keys_end_the_insert_replay(self):
         editor = self._paging_editor()
         editor.cursor_row = 0
         editor._enter_insert()
 
+        editor._handle_insert(ord("A"))
         editor._handle_insert(curses.KEY_NPAGE)
         editor._handle_insert(curses.KEY_PPAGE)
+        self.assertEqual(editor._insert_replay_keys, [ord("A")])
 
-        self.assertEqual(editor._insert_replay_keys,
-                         [curses.KEY_NPAGE, curses.KEY_PPAGE])
+        editor._handle_insert(ord("B"))
+        self.assertEqual(editor._insert_replay_keys, [ord("B")])
 
     def test_normal_mode_scroll_keys_request_hidden_cursor(self):
         # Ctrl-F/PgDn, Ctrl-B/PgUp, Ctrl-D, Ctrl-U, Ctrl-E, Ctrl-Y
@@ -14878,9 +14972,8 @@ class InputHandlingTests(unittest.TestCase):
                         side_effect=lambda v: events.append(("curs_set", v))), \
                 mock.patch("curses.noecho"), \
                 mock.patch("curses.start_color"), \
-                mock.patch("curses.use_default_colors"):
-            with self.assertRaises(IndexError):
-                editor.edit(Screen())
+                mock.patch("curses.use_default_colors"), self.assertRaises(IndexError):
+            editor.edit(Screen())
 
         # Visible at startup, first frame drawn with a visible cursor; the
         # frame after the paging key is drawn hidden, then re-shown.
@@ -14911,9 +15004,8 @@ class InputHandlingTests(unittest.TestCase):
         with mock.patch("curses.curs_set", side_effect=curses.error("boom")), \
                 mock.patch("curses.noecho"), \
                 mock.patch("curses.start_color"), \
-                mock.patch("curses.use_default_colors"):
-            with self.assertRaises(IndexError):
-                editor.edit(Screen())
+                mock.patch("curses.use_default_colors"), self.assertRaises(IndexError):
+            editor.edit(Screen())
 
         self.assertEqual(len(draws), 2)  # both frames still painted
 
@@ -15383,9 +15475,8 @@ class SuspendResumeTests(unittest.TestCase):
 
         screen = ErrScreen([])
 
-        with self._patched_curses_init():
-            with self.assertRaises(curses.error):
-                editor.edit(screen)
+        with self._patched_curses_init(), self.assertRaises(curses.error):
+            editor.edit(screen)
 
         editor._save_session.assert_called_once()
         editor._handle_normal.assert_not_called()
@@ -15447,9 +15538,8 @@ class CrashRecoveryTests(unittest.TestCase):
             editor._handle_normal = mock.MagicMock(side_effect=RuntimeError("dispatch bug"))
             screen = SuspendResumeTests.FakeScreen([ord("x")])
 
-            with SuspendResumeTests._patched_curses_init():
-                with self.assertRaises(RuntimeError):
-                    editor.edit(screen)
+            with SuspendResumeTests._patched_curses_init(), self.assertRaises(RuntimeError):
+                editor.edit(screen)
 
             self.assertEqual(editor.crash_dump_paths, [path + ".vii_crash"])
             with open(path + ".vii_crash", "r", encoding="utf-8") as fh:
@@ -15476,9 +15566,8 @@ class CrashRecoveryTests(unittest.TestCase):
             editor._handle_normal = mock.MagicMock(side_effect=RuntimeError("dispatch bug"))
             screen = SuspendResumeTests.FakeScreen([ord("x")])
 
-            with SuspendResumeTests._patched_curses_init():
-                with self.assertRaises(RuntimeError) as ctx:
-                    editor.edit(screen)
+            with SuspendResumeTests._patched_curses_init(), self.assertRaises(RuntimeError) as ctx:
+                editor.edit(screen)
 
             self.assertEqual(str(ctx.exception), "dispatch bug")
             self.assertEqual(editor.crash_dump_paths, [path + ".vii_crash"])
@@ -15787,7 +15876,7 @@ class ShellCommandTests(unittest.TestCase):
         with mock.patch(
             "vi_editor.subprocess.Popen", wraps=subprocess_module.Popen
         ) as popen_mock:
-            returncode, output, truncated, timed_out = (
+            returncode, output, _truncated, timed_out = (
                 editor._run_shell_command_limited("cat", "/bin/sh")
             )
 
@@ -15818,9 +15907,8 @@ class ShellCommandTests(unittest.TestCase):
 
         with mock.patch("vi_editor.subprocess.Popen", side_effect=spy_popen), \
              mock.patch("vi_editor.os.set_blocking",
-                        side_effect=OSError("boom")):
-            with self.assertRaises(OSError):
-                editor._run_shell_command_limited("sleep 5", "/bin/sh")
+                        side_effect=OSError("boom")), self.assertRaises(OSError):
+            editor._run_shell_command_limited("sleep 5", "/bin/sh")
 
         self.assertEqual(len(created), 1)
         proc = created[0]
@@ -17055,6 +17143,19 @@ class BreadcrumbTests(unittest.TestCase):
 
         self.assertEqual(crumbs, ["main"])
 
+    def test_long_declarations_do_not_backtrack_catastrophically(self):
+        # Found by fuzz_vi_editor.py: the function-signature regex took
+        # ~14s on this declaration and ~60s on 18 blanked-out strings.
+        declaration = "int " + ", ".join(f"v{i}" for i in range(40)) + ";"
+        started = time.monotonic()
+        crumbs = self.breadcrumbs_for(
+            "main.c",
+            [declaration, "   _" * 400, "static char* name(int a, char** b) {", "    " + declaration, "}"],
+            3,
+        )
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(crumbs, ["name"])
+
     def test_c_breadcrumbs_ignore_braces_inside_block_comments(self):
         crumbs = self.breadcrumbs_for(
             "main.c",
@@ -17921,6 +18022,27 @@ class SessionTests(unittest.TestCase):
         editor.SESSION_PATH = session_path
         return editor
 
+    def test_session_lock_closes_its_file_when_flock_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            editor = self._editor_with_session(os.path.join(tmpdir, "session"))
+            opened = []
+            real_open = open
+
+            def spy_open(*args, **kwargs):
+                handle = real_open(*args, **kwargs)
+                opened.append(handle)
+                return handle
+
+            with (
+                mock.patch("builtins.open", side_effect=spy_open),
+                mock.patch("vi_editor.fcntl.flock", side_effect=OSError("no locks")),
+                editor._session_lock(),
+            ):
+                # Proceeds unlocked, with the lock file still open meanwhile.
+                self.assertEqual(len(opened), 1)
+                self.assertFalse(opened[0].closed)
+            self.assertTrue(opened[0].closed)
+
     def test_save_session_survives_stale_fixed_tmp_path(self):
         # Older versions used the fixed name SESSION_PATH + ".tmp"; a stale
         # directory squatting there (or a concurrent instance's temp file)
@@ -18649,18 +18771,16 @@ class SessionTests(unittest.TestCase):
         # without relying on chmod, which can be a no-op running as root)
         # must not be treated the same way.
         self.assertEqual(ViEditor._read_project_sections("/no/such/path/at/all"), {})
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with self.assertRaises(OSError):
-                ViEditor._read_project_sections(tmpdir)
+        with tempfile.TemporaryDirectory() as tmpdir, self.assertRaises(OSError):
+            ViEditor._read_project_sections(tmpdir)
 
     def test_read_raw_session_mru_lines_raises_on_real_read_error_not_missing_file(self):
         self.assertEqual(
             ViEditor._read_raw_session_mru_lines("/no/such/path/at/all"),
             ["# vii session"],
         )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with self.assertRaises(OSError):
-                ViEditor._read_raw_session_mru_lines(tmpdir)
+        with tempfile.TemporaryDirectory() as tmpdir, self.assertRaises(OSError):
+            ViEditor._read_raw_session_mru_lines(tmpdir)
 
     def test_project_save_reports_failure_instead_of_false_success(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -18995,9 +19115,8 @@ class SessionTests(unittest.TestCase):
         # same way, or a caller doing a read-modify-write can't tell the
         # difference and may silently discard what it failed to read.
         self.assertEqual(ViEditor._read_session_map("/no/such/path/at/all"), {})
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with self.assertRaises(OSError):
-                ViEditor._read_session_map(tmpdir)
+        with tempfile.TemporaryDirectory() as tmpdir, self.assertRaises(OSError):
+            ViEditor._read_session_map(tmpdir)
 
     def test_save_session_skips_write_on_mru_read_error(self):
         # Same "must never raise but must not silently clobber" contract as
@@ -19320,7 +19439,7 @@ class BugFixTests(unittest.TestCase):
         )
 
         self.assertEqual(editor.lines, ["hi", "there world"])
-        row, col = editor.marks["w"]
+        row, _col = editor.marks["w"]
         self.assertEqual(row, 1, "mark must follow its character onto the split-off row")
 
     # ------------------------------------------------------------------
@@ -19745,31 +19864,31 @@ class BugFixTests(unittest.TestCase):
             with open(os.path.join(tmpdir, "blob.txt"), "w", encoding="utf-8") as fh:
                 fh.write(content)
 
-            editor = ViEditor()
-            editor.FB_GREP_MAX_LINE_BYTES = 64
-            editor.FB_GREP_TIMEOUT_SECONDS = 10.0
             real_monotonic = time.monotonic
             call_count = {"n": 0}
 
             def fake_monotonic():
                 call_count["n"] += 1
-                # Let the deadline get computed and the first couple of
-                # bookkeeping checks pass untouched, then expire on the
-                # very next check -- i.e. after at most one 64-byte chunk
+                # Calls 1-5 cover the deadline computation, the walk/file
+                # bookkeeping and the check before the first chunk. Expire on
+                # the next one -- i.e. after exactly one 64-character chunk
                 # has been read, long before "needle" at offset 500.
-                if call_count["n"] <= 4:
+                if call_count["n"] <= 5:
                     return real_monotonic()
                 return real_monotonic() + 1000
 
-            with mock.patch("vi_editor.time.monotonic", side_effect=fake_monotonic):
-                editor._run_file_browser_grep(tmpdir, "needle")
+            outcome = _grep_scan_tree(
+                tmpdir, "needle", timeout=10.0, max_line_chars=64,
+                clock=fake_monotonic,
+            )
 
             self.assertEqual(
-                editor.grep_results, [],
+                outcome["results"], [],
                 "the deadline must be honored mid-line, before the whole "
                 "no-newline blob can be read in one go",
             )
-            self.assertIn("(truncated)", editor.message)
+            self.assertTrue(outcome["timed_out"])
+            self.assertTrue(outcome["truncated"])
 
     def test_file_browser_grep_skips_overlong_line_but_keeps_scanning(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -20614,106 +20733,109 @@ class FunctionalReviewRegressionTests(unittest.TestCase):
         # independent editor processes. B attempts acquisition while A holds it.
         for operation in ('save', 'force', 'copy', 'range', 'base64', 'rollback'):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory() as td:
-                target = os.path.join(td, 'shared.txt')
-                alias = os.path.join(td, 'alias.txt')
-                with open(target, 'w') as fh:
-                    fh.write('original\n')
-                os.symlink(target, alias)
-                a, b = self.editor(), self.editor()
-                self.assertTrue(a._load_file(target))
-                self.assertTrue(b._load_file(alias))
-                a.lines[0], b.lines[0] = 'writer A', 'writer B'
-                if operation == 'copy':
-                    b.filename = os.path.join(td, 'other.txt')
-                entered, release, attempting, checked = (threading.Event() for _ in range(4))
-                stage, lock, signature, atomic = (
-                    a._stage_generation_backup, b._target_write_lock,
-                    b._file_signature_or_none, a._atomic_write_text,
-                )
-                results, errors = {}, []
+                self._race_two_writers(operation, td)
 
-                def stall_stage(*args):
-                    state = stage(*args)
-                    entered.set()
-                    if not release.wait(5):
-                        raise RuntimeError('test writer was not released')
-                    return state
+    def _race_two_writers(self, operation, td):
+        target = os.path.join(td, 'shared.txt')
+        alias = os.path.join(td, 'alias.txt')
+        with open(target, 'w') as fh:
+            fh.write('original\n')
+        os.symlink(target, alias)
+        a, b = self.editor(), self.editor()
+        self.assertTrue(a._load_file(target))
+        self.assertTrue(b._load_file(alias))
+        a.lines[0], b.lines[0] = 'writer A', 'writer B'
+        if operation == 'copy':
+            b.filename = os.path.join(td, 'other.txt')
+        entered, release, attempting, checked = (threading.Event() for _ in range(4))
+        stage, lock, signature, atomic = (
+            a._stage_generation_backup, b._target_write_lock,
+            b._file_signature_or_none, a._atomic_write_text,
+        )
+        results, errors = {}, []
 
-                def attempted_lock(*args):
-                    attempting.set()
-                    return lock(*args)
+        def stall_stage(*args):
+            state = stage(*args)
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError('test writer was not released')
+            return state
 
-                def checked_signature(*args):
-                    checked.set()
-                    return signature(*args)
+        def attempted_lock(*args):
+            attempting.set()
+            return lock(*args)
 
-                def maybe_fail(path, text, **kwargs):
-                    if operation == 'rollback' and path == target:
-                        raise OSError('simulated primary write failure')
-                    return atomic(path, text, **kwargs)
+        def checked_signature(*args):
+            checked.set()
+            return signature(*args)
 
-                def run_a():
-                    try:
-                        results['a'] = a._save_file()
-                    except Exception as exc:
-                        errors.append(exc)
+        def maybe_fail(path, text, **kwargs):
+            if operation == 'rollback' and path == target:
+                raise OSError('simulated primary write failure')
+            return atomic(path, text, **kwargs)
 
-                def run_b():
-                    try:
-                        if operation == 'range':
-                            result = b._write_line_range_to_file(0, 0, alias)
-                        elif operation == 'base64':
-                            result = b._save_base64_file(alias)
-                        elif operation == 'copy':
-                            result = b._save_file(alias, rename_buffer=False)
-                        else:
-                            result = b._save_file(force=operation == 'force')
-                        results['b'] = result
-                    except Exception as exc:
-                        errors.append(exc)
+        def run_a():
+            try:
+                results['a'] = a._save_file()
+            except Exception as exc:  # noqa: BLE001 - surfaced by the assertion after join
+                errors.append(exc)
 
-                with mock.patch.object(a, '_stage_generation_backup', side_effect=stall_stage), \
-                     mock.patch.object(a, '_atomic_write_text', side_effect=maybe_fail), \
-                     mock.patch.object(b, '_target_write_lock', side_effect=attempted_lock), \
-                     mock.patch.object(b, '_file_signature_or_none', side_effect=checked_signature):
-                    ta = threading.Thread(target=run_a, daemon=True)
-                    tb = threading.Thread(target=run_b, daemon=True)
-                    ta.start()
-                    try:
-                        self.assertTrue(entered.wait(5))
-                        tb.start()
-                        self.assertTrue(attempting.wait(5))
-                        self.assertFalse(checked.wait(0.03))
-                        self.assertNotIn('b', results)
-                    finally:
-                        release.set()
-                        ta.join(5)
-                        if tb.ident is not None:
-                            tb.join(5)
-                self.assertFalse(ta.is_alive())
-                self.assertFalse(tb.is_alive())
-                self.assertEqual(errors, [])
-                self.assertEqual(results['a'], operation != 'rollback')
-                self.assertEqual(results['b'], operation != 'save')
-                self.assertTrue(os.path.islink(alias))
-                with open(target, 'rb') as fh:
-                    actual = fh.read()
-                expected = b'writer A\n' if operation == 'save' else b'writer B\n'
-                if operation == 'base64':
-                    actual = base64.b64decode(actual)
-                self.assertEqual(actual, expected)
-                backup_dir = os.path.join(td, '.vii_backups')
-                backups = sorted(name for name in os.listdir(backup_dir) if name.endswith('.txt'))
-                expected_count = 2 if operation in ('force', 'copy', 'range') else 1
-                self.assertEqual(len(backups), expected_count)
-                texts = []
-                for name in backups:
-                    with open(os.path.join(backup_dir, name)) as fh:
-                        texts.append(fh.read())
-                if expected_count == 2:
-                    self.assertEqual(texts, ['writer A\n', 'writer B\n'])
+        def run_b():
+            try:
+                if operation == 'range':
+                    result = b._write_line_range_to_file(0, 0, alias)
+                elif operation == 'base64':
+                    result = b._save_base64_file(alias)
+                elif operation == 'copy':
+                    result = b._save_file(alias, rename_buffer=False)
                 else:
-                    self.assertEqual(texts, ['writer B\n' if operation == 'rollback' else 'writer A\n'])
+                    result = b._save_file(force=operation == 'force')
+                results['b'] = result
+            except Exception as exc:  # noqa: BLE001 - surfaced by the assertion after join
+                errors.append(exc)
+
+        with mock.patch.object(a, '_stage_generation_backup', side_effect=stall_stage), \
+             mock.patch.object(a, '_atomic_write_text', side_effect=maybe_fail), \
+             mock.patch.object(b, '_target_write_lock', side_effect=attempted_lock), \
+             mock.patch.object(b, '_file_signature_or_none', side_effect=checked_signature):
+            ta = threading.Thread(target=run_a, daemon=True)
+            tb = threading.Thread(target=run_b, daemon=True)
+            ta.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                tb.start()
+                self.assertTrue(attempting.wait(5))
+                self.assertFalse(checked.wait(0.03))
+                self.assertNotIn('b', results)
+            finally:
+                release.set()
+                ta.join(5)
+                if tb.ident is not None:
+                    tb.join(5)
+        self.assertFalse(ta.is_alive())
+        self.assertFalse(tb.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results['a'], operation != 'rollback')
+        self.assertEqual(results['b'], operation != 'save')
+        self.assertTrue(os.path.islink(alias))
+        with open(target, 'rb') as fh:
+            actual = fh.read()
+        expected = b'writer A\n' if operation == 'save' else b'writer B\n'
+        if operation == 'base64':
+            actual = base64.b64decode(actual)
+        self.assertEqual(actual, expected)
+        backup_dir = os.path.join(td, '.vii_backups')
+        backups = sorted(name for name in os.listdir(backup_dir) if name.endswith('.txt'))
+        expected_count = 2 if operation in ('force', 'copy', 'range') else 1
+        self.assertEqual(len(backups), expected_count)
+        texts = []
+        for name in backups:
+            with open(os.path.join(backup_dir, name)) as fh:
+                texts.append(fh.read())
+        if expected_count == 2:
+            self.assertEqual(texts, ['writer A\n', 'writer B\n'])
+        else:
+            self.assertEqual(texts, ['writer B\n' if operation == 'rollback' else 'writer A\n'])
 
     def test_write_lock_failure_leaves_file_and_backups_untouched(self):
         with tempfile.TemporaryDirectory() as td:
@@ -21226,23 +21348,16 @@ class MarkdownWrapTests(unittest.TestCase):
                 editor.mode = mode
                 editor.visual_start = (0, 2)
                 self.draw(editor, self.Screen(width=10))
-                def key(value):
-                    if mode == Mode.NORMAL:
-                        editor._handle_normal(value, 8, 10)
-                    elif mode == Mode.INSERT:
-                        editor._handle_insert(value)
-                    elif mode == Mode.REPLACE:
-                        editor._handle_replace_mode(value)
-                    else:
-                        editor._handle_visual(value)
-                key(curses.KEY_DOWN)
-                self.assertEqual((editor.cursor_row, editor.cursor_col), (0, 12))
-                key(curses.KEY_DOWN)
-                self.assertEqual((editor.cursor_row, editor.cursor_col), (0, 22))
-                key(curses.KEY_DOWN)
-                self.assertEqual((editor.cursor_row, editor.cursor_col), (1, 2))
-                key(curses.KEY_UP)
-                self.assertEqual((editor.cursor_row, editor.cursor_col), (0, 22))
+                handle = {
+                    Mode.NORMAL: editor._handle_normal,
+                    Mode.INSERT: editor._handle_insert,
+                    Mode.REPLACE: editor._handle_replace_mode,
+                }.get(mode, editor._handle_visual)
+                extra = (8, 10) if mode == Mode.NORMAL else ()
+                for key, expected in ((curses.KEY_DOWN, (0, 12)), (curses.KEY_DOWN, (0, 22)),
+                                      (curses.KEY_DOWN, (1, 2)), (curses.KEY_UP, (0, 22))):
+                    handle(key, *extra)
+                    self.assertEqual((editor.cursor_row, editor.cursor_col), expected)
 
     def test_j_k_keep_file_line_motions_and_gj_gk_use_display_rows(self):
         editor = self.editor(["a" * 26, "tail"])
@@ -21481,6 +21596,67 @@ class InsertReplaceVimBehaviorTests(unittest.TestCase):
         for key in keys:
             for k in (map(ord, key) if isinstance(key, str) else (key,)):
                 editor._dispatch_key(k, screen)
+
+    def test_replace_append_moves_end_marks_without_diffing_the_line(self):
+        # A counted R replays every typed character; diffing the whole line
+        # for each appended one made `64R` + a long run quadratic (found by
+        # the fuzzer as a multi-second Esc).
+        editor = self.editor(["ab", "next"], (0, 0))
+        editor.marks = {"a": (0, 1), "b": (0, 2), "c": (1, 0)}
+        with mock.patch.object(editor, "_adjust_marks_for_line_replace",
+                               wraps=editor._adjust_marks_for_line_replace) as diff:
+            self.send(editor, "3R", "xyz", 27)
+            self.assertEqual(diff.call_count, 0)
+        self.assertEqual(editor.lines, ["xyzxyzxyz", "next"])
+        # Same marks as the diff gave (a mark past the end is clamped onto
+        # the last character, so "b" stays with "a").
+        self.assertEqual(editor.marks, {"a": (0, 1), "b": (0, 1), "c": (1, 0)})
+
+    def test_tabstop_and_shiftwidth_are_capped_at_vims_limit(self):
+        # shiftwidth=99999999 made one Tab insert 100M spaces (a hang).
+        editor = self.editor(["x"])
+        for option in ("shiftwidth", "sw", "tabstop", "ts"):
+            editor._execute_cmd(f"set {option}=99999999")
+            self.assertIn("1 to 9999", editor.message)
+        self.assertEqual((editor.shift_width, editor.tab_stop), (4, 8))
+        editor._execute_cmd("set sw=9999 ts=9999")
+        self.assertEqual((editor.shift_width, editor.tab_stop), (9999, 9999))
+
+    def test_repeated_insert_merges_typed_runs_into_one_edit_per_repeat(self):
+        def run(merge):
+            editor = self.editor(["ab", "cd"], (0, 1))
+            editor.marks = {"a": (0, 1), "b": (0, 0), "c": (1, 1)}
+            if not merge:
+                editor._merged_insert_keys = list
+            self.send(editor, "3i", "xy", curses.KEY_BACKSPACE, "zé", 27)
+            with mock.patch.object(editor, "_insert_char", wraps=editor._insert_char) as insert:
+                self.send(editor, ".")
+            calls = [call.args[0] for call in insert.call_args_list]
+            state = (list(editor.lines), dict(editor.marks), editor.cursor_col)
+            self.send(editor, "u")
+            return calls, state, list(editor.lines)
+
+        merged_calls, merged_state, merged_undone = run(True)
+        typed_calls, typed_state, typed_undone = run(False)
+        # Each repeat inserts "xy" and "zé" in one edit apiece...
+        self.assertEqual(merged_calls, ["xy", "zé"] * 3)
+        self.assertEqual(typed_calls, ["x", "y", "z", "é"] * 3)
+        # ...with the same text, marks, cursor and undo as typing them singly.
+        self.assertEqual(merged_state, typed_state)
+        # `.` inserts before the cursor, which Esc left on the last "é".
+        self.assertEqual(merged_state[0][0], "axzéxzéxz" + "xzé" * 3 + "éb")
+        self.assertEqual(merged_undone, typed_undone)
+
+    def test_replay_does_not_rescan_for_completions(self):
+        editor = self.editor(["alpha", ""], (1, 0))
+        editor.intellisense = True
+        with mock.patch.object(editor, "_intellisense_word_bounds",
+                               wraps=editor._intellisense_word_bounds) as scan:
+            self.send(editor, "5a", "al", 27)
+        typed_scans = scan.call_count
+        self.assertEqual(editor.lines[1], "al" * 5)
+        self.assertLessEqual(typed_scans, 2)  # once per typed key, none for the 4 copies
+        self.assertFalse(editor._intellisense_completion_matches)
 
     # --- Replace-mode backspace never deletes original text ---------------
 
@@ -22830,7 +23006,7 @@ curses.wrapper(run)
         self.assertEqual(editor._visual_block_bounds()[2:], (45, 45))
 
     def test_counted_down_from_virtual_rows_keeps_virtual_column(self):
-        editor, screen, _ = self.virtual_rows_editor(["a" * 50, "x", "y", "a" * 50])
+        editor, _screen, _ = self.virtual_rows_editor(["a" * 50, "x", "y", "a" * 50])
         self.send(editor, "2", curses.KEY_DOWN)
         self.assertEqual(editor.cursor_row, 3)
         self.assertEqual(editor._visual_block_bounds()[2:], (45, 45))
@@ -22874,7 +23050,7 @@ curses.wrapper(run)
 class ParagraphTextObjectTests(unittest.TestCase):
     editor = VisualModeCommandTests.editor
     send = VisualModeCommandTests.send
-    LINES = ["a1", "a2", "", "", "b1", "b2", "  ", "c1"]
+    LINES: typing.ClassVar[list[str]] = ["a1", "a2", "", "", "b1", "b2", "  ", "c1"]
 
     def run_keys(self, cursor, *keys, lines=None):
         editor = self.editor(list(lines or self.LINES), cursor)
@@ -22938,6 +23114,392 @@ class ParagraphTextObjectTests(unittest.TestCase):
         editor = self.run_keys((0, 0), "dap", lines=[""])
         self.assertEqual(editor.lines, [""])
         self.assertFalse(editor.modified)
+
+
+class InsertModeReviewTests(unittest.TestCase):
+    editor = VisualModeCommandTests.editor
+    send = VisualModeCommandTests.send
+
+    def mapped_editor(self, tmpdir):
+        path = os.path.join(tmpdir, "large.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("alpha\nbeta\ngamma\n")
+        editor = ViEditor()
+        editor.LARGE_FILE_MMAP_THRESHOLD = 1
+        editor._load_file(path)
+        self.assertTrue(editor.lines.is_mapped)
+        return editor
+
+    def test_noop_insert_on_mapped_file_leaves_buffer_clean(self):
+        for keys in (("i", 27), ("a", 27), ("R", 27), ("o", 127, 27), ("V<",)):
+            with self.subTest(keys=keys), tempfile.TemporaryDirectory() as tmpdir:
+                editor = self.mapped_editor(tmpdir)
+                self.send(editor, *keys)
+                self.assertEqual(editor.lines[:3], ["alpha", "beta", "gamma"])
+                self.assertFalse(editor.modified)
+                self.assertFalse(editor._current_buffer_is_modified())
+                editor._sync_current_buffer()
+                self.assertTrue(editor._check_unsaved_changes("quit"))
+
+    def test_edits_on_mapped_file_are_still_tracked(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            editor = self.mapped_editor(tmpdir)
+            self.send(editor, "i", 27, "ix", 27)
+            self.assertTrue(editor._current_buffer_is_modified())
+            self.send(editor, "u")
+            self.assertFalse(editor._current_buffer_is_modified())
+
+    def test_modified_check_compares_saved_content_without_hashing(self):
+        editor = self.editor(["abc"] * 1000, (0, 0))
+        editor.filename = None
+        editor._mark_clean()
+        with mock.patch.object(ViEditor, "_line_signature",
+                               side_effect=AssertionError("hashed")):
+            self.send(editor, "ix", 27)
+            self.assertTrue(editor.modified)
+            self.send(editor, "u")
+            self.assertFalse(editor.modified)
+            self.send(editor, "iy", 127, 27)      # typed and removed again
+            self.assertFalse(editor.modified)
+            self.send(editor, "ddu")
+            self.assertFalse(editor.modified)
+            editor.line_endings[0] = "\r\n"
+            editor._refresh_modified()
+            self.assertTrue(editor.modified)
+
+    def test_modified_check_falls_back_to_signature_for_unknown_baseline(self):
+        editor = self.editor(["abc", "def"], (0, 0))
+        editor._mark_clean()
+        editor._saved_contents.clear()
+        self.send(editor, "ix", 27)
+        self.assertTrue(editor.modified)
+        self.send(editor, "u")
+        self.assertFalse(editor.modified)
+        # The exact signature check repopulates the fast path.
+        self.assertIn(editor._saved_signature, editor._saved_contents)
+
+    def test_dot_after_page_key_repeats_only_text_at_the_cursor(self):
+        editor = self.editor([f"L{i}" for i in range(100)], (50, 0))
+        editor._last_h = 22
+        self.send(editor, "iA", curses.KEY_NPAGE, "B", 27)
+        edited = [row for row, line in enumerate(editor.lines) if line != f"L{row}"]
+        self.send(editor, "gg0.")
+        self.assertEqual(editor.lines[0], "BL0")
+        self.assertEqual([row for row, line in enumerate(editor.lines)
+                          if line != f"L{row}"], [0] + edited)
+
+    def test_count_is_not_repeated_across_a_cursor_key(self):
+        editor = self.editor(["one", "two", "three"], (2, 0))
+        self.send(editor, "2ix", curses.KEY_UP, 27)
+        self.assertEqual(editor.lines, ["one", "two", "xthree"])
+
+        editor = self.editor(["a", "b"], (0, 0))
+        self.send(editor, "3ofoo", curses.KEY_UP, 27)
+        self.assertEqual(editor.lines, ["a", "foo", "b"])
+
+        editor = self.editor(["one", "two"], (1, 0))
+        self.send(editor, "ifoo", curses.KEY_UP, 27, "0.")
+        self.assertEqual(editor.lines, ["fooone", "footwo"])
+
+    def test_replace_after_cursor_key_repeats_only_later_text(self):
+        editor = self.editor(["abcdef", "abcdef"], (0, 0))
+        self.send(editor, "Rxy", curses.KEY_LEFT, "z", 27, "j0.")
+        self.assertEqual(editor.lines, ["xzcdef", "zbcdef"])
+        self.send(editor, "u", "u")
+        self.assertEqual(editor.lines, ["xycdef", "abcdef"])
+
+    def test_paste_after_cursor_key_starts_a_new_change(self):
+        editor = self.editor(["one", "two"], (1, 0))
+        self.send(editor, "ifoo", curses.KEY_UP)
+        editor._insert_pasted_text("P")
+        self.send(editor, 27)
+        self.assertEqual(editor.lines, ["oneP", "footwo"])
+        self.send(editor, "j$.")
+        self.assertEqual(editor.lines, ["oneP", "footwPo"])
+
+
+class GrepHardeningTests(unittest.TestCase):
+    """Regressions for the file-browser grep hardening pass.
+
+    The scan used to run a compiled user regex in the editor process with no
+    way to interrupt it, keep whole matching lines, silently skip unreadable
+    paths, split masks on whitespace, and miss the hidden-root case for
+    relative paths.
+    """
+
+    def scan(self, root, pattern, file_mask="*", include_hidden=False, **kwargs):
+        return _grep_scan_tree(root, pattern, file_mask, include_hidden, **kwargs)
+
+    def test_grep_compile_recursion_and_overflow_fall_back_to_plain_text(self):
+        recursive = "(" * 100000 + ")" * 100000
+        overflow = "a{100000000000000000000}"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "patterns.txt"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(recursive + "\n" + overflow + "\n")
+
+            for pattern in (recursive, overflow):
+                outcome = self.scan(tmpdir, pattern)
+                self.assertTrue(outcome["plain_text"], pattern[:24])
+                self.assertEqual(len(outcome["results"]), 1, pattern[:24])
+                self.assertIn(pattern[:24], outcome["results"][0].text)
+
+            editor = ViEditor()
+            editor._run_file_browser_grep(tmpdir, overflow)
+            self.assertIn("(plain text)", editor.grep_result_label)
+            self.assertEqual(len(editor.grep_results), 1)
+
+    def test_grep_kills_catastrophic_regex_at_deadline(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "evil.txt"), "w",
+                      encoding="utf-8") as fh:
+                # A matching line is cheap; the trailing "!" forces the
+                # exponential failure path in "(a+)+$".
+                fh.write(("a" * 27) + "!\n")
+
+            editor = ViEditor()
+            editor.FB_GREP_TIMEOUT_SECONDS = 0.2
+            editor.FB_GREP_WORKER_GRACE_SECONDS = 0.2
+            started = time.monotonic()
+            editor._run_file_browser_grep(tmpdir, "(a+)+$")
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 3.0)
+            self.assertEqual(editor.grep_results, [])
+            self.assertIn("[incomplete", editor.grep_result_label)
+            self.assertIn("timeout", editor.grep_result_label)
+            self.assertIn("(truncated)", editor.message)
+
+    def test_grep_preview_is_bounded_and_keeps_match_visible(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            line = ("x" * 5000) + "needle" + ("y" * 5000)
+            with open(os.path.join(tmpdir, "long.txt"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(line + "\n")
+
+            outcome = self.scan(tmpdir, "needle", preview_chars=100)
+
+            self.assertEqual(len(outcome["results"]), 1)
+            text = outcome["results"][0].text
+            self.assertIn("needle", text)
+            self.assertLessEqual(len(text), 106)
+            self.assertNotEqual(text, line)
+
+    def test_grep_result_byte_budget_stops_and_reports_size_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(20):
+                path = os.path.join(tmpdir, f"f{i}.txt")
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("needle\n" * 5)
+
+            outcome = self.scan(tmpdir, "needle", max_result_bytes=200)
+
+            self.assertTrue(outcome["results"])
+            self.assertTrue(outcome["truncated"])
+            self.assertEqual(outcome["stop_reason"], "bytes")
+            self.assertLessEqual(outcome["result_bytes"], 200)
+
+    def test_file_browser_grep_uses_bounded_preview(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            line = ("a" * 2000) + "needle" + ("b" * 2000)
+            with open(os.path.join(tmpdir, "long.txt"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(line + "\n")
+
+            editor = ViEditor()
+            editor.FB_GREP_PREVIEW_CHARS = 40
+            editor.draw = mock.MagicMock()
+            editor._run_file_browser_grep(tmpdir, "needle")
+
+            self.assertEqual(len(editor.grep_results), 1)
+            text = editor.grep_results[0].text
+            self.assertIn("needle", text)
+            self.assertLessEqual(len(text), 46)
+            # Headless/direct calls must not repaint or poll the terminal.
+            editor.draw.assert_not_called()
+
+    @unittest.skipIf(getattr(os, "geteuid", lambda: 1)() == 0,
+                     "permission-denied checks need a non-root user")
+    def test_grep_reports_unreadable_files_and_directories(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            blocked_dir = os.path.join(tmpdir, "blocked")
+            os.mkdir(blocked_dir)
+            with open(os.path.join(blocked_dir, "secret.txt"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("needle\n")
+            unreadable = os.path.join(tmpdir, "unreadable.txt")
+            with open(unreadable, "w", encoding="utf-8") as fh:
+                fh.write("needle\n")
+
+            os.chmod(unreadable, 0)
+            os.chmod(blocked_dir, 0)
+            try:
+                editor = ViEditor()
+                editor._run_file_browser_grep(tmpdir, "needle")
+            finally:
+                os.chmod(blocked_dir, 0o700)
+                os.chmod(unreadable, 0o600)
+
+            self.assertIn("[incomplete", editor.grep_result_label)
+            self.assertIn("unreadable file", editor.grep_result_label)
+            self.assertIn("unreadable dir", editor.grep_result_label)
+            self.assertIn("unreadable file", editor.message)
+            self.assertIn("(truncated)", editor.message)
+
+    def test_grep_reports_overlong_line_as_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "f.txt"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(("x" * 100) + "needle\nsecond needle line\n")
+
+            editor = ViEditor()
+            editor.FB_GREP_MAX_LINE_BYTES = 50
+            editor._run_file_browser_grep(tmpdir, "needle")
+
+            self.assertEqual(len(editor.grep_results), 1)
+            self.assertIn("overlong line", editor.grep_result_label)
+            self.assertIn("overlong line", editor.message)
+            self.assertIn("(truncated)", editor.message)
+
+    def test_grep_cancel_check_is_event_loop_only_and_requeues_keys(self):
+        class FakeScreen:
+            def __init__(self, key):
+                self.key = key
+
+            def timeout(self, _value):
+                pass
+
+            def get_wch(self):
+                return self.key
+
+        editor = ViEditor()
+        editor._in_event_loop = False
+        self.assertFalse(editor._grep_cancel_requested(FakeScreen(27)))
+
+        editor._in_event_loop = True
+        self.assertTrue(editor._grep_cancel_requested(FakeScreen(27)))
+        self.assertFalse(editor._grep_cancel_requested(FakeScreen(ord("x"))))
+        self.assertEqual(list(editor._pending_keys), [ord("x")])
+
+    def test_grep_escape_cancels_runaway_scan_without_opening_results(self):
+        class EscapeScreen:
+            def timeout(self, _value):
+                pass
+
+            def get_wch(self):
+                return 27
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "evil.txt"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(("a" * 27) + "!\n")
+
+            editor = ViEditor()
+            editor.mode = Mode.FILE_BROWSER
+            editor._in_event_loop = True
+            editor._stdscr = EscapeScreen()
+            editor.draw = mock.MagicMock()
+            editor.FB_GREP_TIMEOUT_SECONDS = 10.0
+            editor.FB_GREP_WORKER_GRACE_SECONDS = 2.0
+            started = time.monotonic()
+            editor._run_file_browser_grep(tmpdir, "(a+)+$")
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 3.0)
+            self.assertEqual(editor.mode, Mode.FILE_BROWSER)
+            self.assertEqual(editor.grep_results, [])
+            self.assertIn("cancelled", editor.message)
+            self.assertTrue(editor.draw.called)
+
+    def test_grep_mask_splits_only_on_semicolon_and_comma(self):
+        self.assertEqual(_grep_split_masks("my file.txt"), ["my file.txt"])
+        self.assertEqual(
+            _grep_split_masks(" *.py ; notes.txt, other file.md "),
+            ["*.py", "notes.txt", "other file.md"],
+        )
+        self.assertEqual(_grep_split_masks("  "), ["*"])
+        self.assertTrue(_grep_mask_matches("my file.txt", ["my file.txt"]))
+        self.assertFalse(_grep_mask_matches("my", ["my file.txt"]))
+
+    def test_grep_file_mask_with_space_matches_whole_filename(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "my notes.txt")
+            with open(target, "w", encoding="utf-8") as fh:
+                fh.write("needle\n")
+
+            editor = ViEditor()
+            editor._run_file_browser_grep(tmpdir, "needle", "my notes.txt")
+
+            self.assertEqual([result.filename for result in editor.grep_results],
+                             [target])
+
+    def test_grep_relative_dot_in_hidden_directory_includes_hidden_entries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hidden_dir = os.path.join(tmpdir, ".hidden")
+            os.mkdir(hidden_dir)
+            target = os.path.join(hidden_dir, ".inner.txt")
+            with open(target, "w", encoding="utf-8") as fh:
+                fh.write("needle\n")
+            subdir = os.path.join(hidden_dir, "sub")
+            os.mkdir(subdir)
+
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(hidden_dir)
+                editor = ViEditor()
+                editor._run_file_browser_grep(".", "needle")
+                self.assertEqual([result.filename for result in editor.grep_results],
+                                 [target])
+                self.assertTrue(os.path.isabs(editor.grep_results[0].filename))
+
+                os.chdir(subdir)
+                parent_editor = ViEditor()
+                parent_editor._run_file_browser_grep("..", "needle")
+                self.assertEqual(
+                    [result.filename for result in parent_editor.grep_results],
+                    [target],
+                )
+            finally:
+                os.chdir(old_cwd)
+
+
+@unittest.skipIf(shutil.which("ruff") is None, "ruff is not installed")
+class RepositoryLintTests(unittest.TestCase):
+    """`ruff check .` stays clean, using the repo's ruff.toml."""
+
+    REPO = os.path.dirname(os.path.abspath(__file__))
+
+    def ruff(self, cwd):
+        return subprocess.run(
+            ["ruff", "check", "--no-cache", "--output-format", "concise", "."],
+            cwd=cwd, capture_output=True, text=True, timeout=120, check=False,
+        )
+
+    def test_repository_is_lint_clean(self):
+        result = self.ruff(self.REPO)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_config_skips_backups_and_file_modes_but_not_sources(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shutil.copy(os.path.join(self.REPO, "ruff.toml"), tmpdir)
+            os.mkdir(os.path.join(tmpdir, ".vii_backups"))
+            unused_import = "import os\n"
+            with open(os.path.join(tmpdir, ".vii_backups", "old_1.py"), "w") as fh:
+                fh.write(unused_import)
+            # ngit checkouts lose modes: a script's shebang without +x is fine.
+            script = os.path.join(tmpdir, "script.py")
+            with open(script, "w") as fh:
+                fh.write("#!/usr/bin/env python3\nprint('hi')\n")
+            os.chmod(script, 0o644)
+            result = self.ruff(tmpdir)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            with open(os.path.join(tmpdir, "source.py"), "w") as fh:
+                fh.write(unused_import)
+            result = self.ruff(tmpdir)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("source.py", result.stdout)
+            self.assertNotIn(".vii_backups", result.stdout)
 
 
 if __name__ == "__main__":

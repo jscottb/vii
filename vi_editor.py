@@ -10,21 +10,20 @@
 #
 #####
 
-import curses
+import array
+import base64
 import codecs
-import errno
-import sys
-import os
-import re
 import contextlib
+import curses
+import errno
 import fcntl
 import fnmatch
-import json
-import base64
 import hashlib
 import io
-import array
+import json
 import mmap
+import os
+import re
 import secrets
 import selectors
 import shutil
@@ -32,18 +31,19 @@ import signal
 import stat
 import string
 import subprocess
+import sys
 import tempfile
 import time
 import unicodedata
 import uuid
+import warnings
 from bisect import bisect_left, bisect_right
-from collections import deque, OrderedDict
-from collections.abc import MutableSequence, Sequence
-from typing import Callable, Iterator, List, Tuple, Optional, Union
+from collections import OrderedDict, deque
+from collections.abc import Callable, Iterator, MutableSequence, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
-
+from typing import ClassVar
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -88,14 +88,14 @@ VISUAL_MODES = (Mode.VISUAL, Mode.VISUAL_LINE, Mode.VISUAL_BLOCK)
 
 @dataclass
 class UndoState:
-    lines: List[str]
+    lines: list[str]
     cursor_row: int
     cursor_col: int
-    marks: dict[str, Tuple[int, int]]
+    marks: dict[str, tuple[int, int]]
     auto_marks: dict[int, int] = field(default_factory=dict)
-    line_endings: List[str] = field(default_factory=list)
+    line_endings: list[str] = field(default_factory=list)
     line_endings_trusted: bool = False
-    last_jump: Optional[Tuple[int, int]] = None
+    last_jump: tuple[int, int] | None = None
     byte_cost: int = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
@@ -114,26 +114,26 @@ class CLikeParseState:
 
     in_block_comment: bool = False
     depth: int = 0
-    stack: Tuple[Tuple[int, int, str], ...] = ()
-    pending: Optional[Tuple[str, int]] = None
+    stack: tuple[tuple[int, int, str], ...] = ()
+    pending: tuple[str, int] | None = None
 
 
 @dataclass(frozen=True)
 class CLikeLineAnalysis:
-    spans: Tuple[Tuple[int, int, str], ...]
+    spans: tuple[tuple[int, int, str], ...]
     structure: str
     out_block_comment: bool
-    brackets: Tuple[Tuple[int, str], ...]
+    brackets: tuple[tuple[int, str], ...]
 
 
 class TrackedLines(list):
     """List that reports the earliest row affected by an in-place mutation."""
 
-    def __init__(self, values=(), mutation_callback: Optional[Callable[[int], None]] = None):
+    def __init__(self, values=(), mutation_callback: Callable[[int], None] | None = None):
         super().__init__(values)
         self._mutation_callback = mutation_callback
 
-    def set_mutation_callback(self, callback: Optional[Callable[[int], None]]) -> None:
+    def set_mutation_callback(self, callback: Callable[[int], None] | None) -> None:
         self._mutation_callback = callback
 
     def _changed(self, index: int = 0) -> None:
@@ -222,7 +222,7 @@ class MMapLineStore(MutableSequence):
     line, more than simply decoding the whole file into a list of str."""
 
     _ENDINGS = ("", "\n", "\r\n", "\r")
-    _ENDING_CODES = {"": 0, "\n": 1, "\r\n": 2, "\r": 3}
+    _ENDING_CODES: ClassVar[dict[str, int]] = {"": 0, "\n": 1, "\r\n": 2, "\r": 3}
     # Bytes decoded per batch when materializing, so the temporary copy of
     # the raw bytes stays bounded no matter how large the file is.
     MATERIALIZE_CHUNK = 64 * 1024 * 1024
@@ -234,9 +234,9 @@ class MMapLineStore(MutableSequence):
         self._mmap = None
         self._starts = array.array("Q", [0, 0])
         self._ending_codes = bytearray(1)
-        self._lines: Optional[List[str]] = None
+        self._lines: list[str] | None = None
         self._size = os.fstat(self._fh.fileno()).st_size
-        self._mutation_callback: Optional[Callable[[int], None]] = None
+        self._mutation_callback: Callable[[int], None] | None = None
         if self._size == 0:
             self._lines = [""]
             self.close()
@@ -259,7 +259,7 @@ class MMapLineStore(MutableSequence):
             raise
         self._starts, self._ending_codes = self._build_ranges()
 
-    def _build_ranges(self) -> Tuple["array.array[int]", bytearray]:
+    def _build_ranges(self) -> tuple["array.array[int]", bytearray]:
         """(line start offsets plus a final end-of-data offset, one ending
         code per line)."""
         size = len(self._mmap)
@@ -322,10 +322,10 @@ class MMapLineStore(MutableSequence):
         mapping no longer shows the file's text."""
         return self.is_mapped and self._readable_limit() < self._size
 
-    def _materialize(self) -> List[str]:
+    def _materialize(self) -> list[str]:
         if self._lines is None:
             limit = self._readable_limit()
-            lines: List[str] = []
+            lines: list[str] = []
             if limit < self._size:
                 lines = [self._line_at(i, limit) for i in range(self._line_count())]
             else:
@@ -335,7 +335,7 @@ class MMapLineStore(MutableSequence):
             self.close()
         return self._lines
 
-    def _batches(self) -> Iterator[Tuple[int, int]]:
+    def _batches(self) -> Iterator[tuple[int, int]]:
         """[first, last) line batches of about MATERIALIZE_CHUNK bytes."""
         starts = self._starts
         count = self._line_count()
@@ -350,7 +350,7 @@ class MMapLineStore(MutableSequence):
             yield first, last
             first = last
 
-    def _decode_batch(self, first: int, last: int) -> List[str]:
+    def _decode_batch(self, first: int, last: int) -> list[str]:
         """Decode lines first..last-1 with one bytes.splitlines (C speed),
         which breaks on exactly the \n / \r\n / \r boundaries
         _build_ranges uses."""
@@ -365,7 +365,7 @@ class MMapLineStore(MutableSequence):
     def _line_end(self, index: int) -> int:
         return self._starts[index + 1] - len(self._ENDINGS[self._ending_codes[index]])
 
-    def _line_at(self, index: int, limit: Optional[int] = None) -> str:
+    def _line_at(self, index: int, limit: int | None = None) -> str:
         if self._mmap is None:
             raise RuntimeError("mmap is closed")
         if limit is None:
@@ -393,16 +393,16 @@ class MMapLineStore(MutableSequence):
         finally:
             self._fh.seek(0)
 
-    def line_endings(self) -> List[str]:
+    def line_endings(self) -> list[str]:
         endings = self._ENDINGS
         return [endings[code] for code in self._ending_codes]
 
-    def line_ending_at(self, row: int) -> Optional[str]:
+    def line_ending_at(self, row: int) -> str | None:
         if 0 <= row < len(self._ending_codes):
             return self._ENDINGS[self._ending_codes[row]]
         return None
 
-    def raw_bytes(self) -> Optional[bytes]:
+    def raw_bytes(self) -> bytes | None:
         """Copy of the on-disk byte image, or None once materialized.
 
         Clamped like _line_at: if the file shrank externally, pages past the
@@ -436,10 +436,9 @@ class MMapLineStore(MutableSequence):
             self._fh = None
 
     def __del__(self):
-        try:
+        # AttributeError: __init__ failed before the handles were set.
+        with contextlib.suppress(OSError, BufferError, ValueError, AttributeError):
             self.close()
-        except Exception:
-            pass
 
     def __len__(self) -> int:
         return len(self._lines) if self._lines is not None else self._line_count()
@@ -494,7 +493,7 @@ class MMapLineStore(MutableSequence):
         self._materialize().append(value)
         self._notify_mutation(index)
 
-    def set_mutation_callback(self, callback: Optional[Callable[[int], None]]) -> None:
+    def set_mutation_callback(self, callback: Callable[[int], None] | None) -> None:
         self._mutation_callback = callback
 
     def _notify_mutation(self, index: int) -> None:
@@ -563,28 +562,28 @@ class _VirtualWrappedLayout(Sequence):
 
 @dataclass
 class BufferState:
-    filename: Optional[str]
-    lines: Union[List[str], MMapLineStore]
+    filename: str | None
+    lines: list[str] | MMapLineStore
     saved_signature: object
     cursor_row: int
     cursor_col: int
     modified: bool
     top_line: int
     left_col: int
-    undo_stack: List[UndoState]
-    redo_stack: List[UndoState]
-    marks: dict[str, Tuple[int, int]]
+    undo_stack: list[UndoState]
+    redo_stack: list[UndoState]
+    marks: dict[str, tuple[int, int]]
     auto_marks: dict[int, int] = field(default_factory=dict)
-    line_endings: List[str] = field(default_factory=list)
+    line_endings: list[str] = field(default_factory=list)
     line_endings_trusted: bool = False
-    log_type: Optional[str] = None
-    saved_file_signature: Optional[Tuple[str, str, int, int]] = None
-    last_jump: Optional[Tuple[int, int]] = None
+    log_type: str | None = None
+    saved_file_signature: tuple[str, str, int, int] | None = None
+    last_jump: tuple[int, int] | None = None
     buffer_id: object = field(default_factory=object, compare=False, repr=False)
     top_wrap: int = 0
     # The buffer's own line ending (vim's 'fileformat'): new lines get it and
     # a save writes it. None means "use the lnendings option".
-    line_ending: Optional[str] = None
+    line_ending: str | None = None
 
 
 @dataclass
@@ -605,8 +604,8 @@ class FileBrowserPanel:
     sort_mode: str = "name"
     reverse_sort: bool = False
     selected: set[str] = field(default_factory=set)
-    entries_cache_key: Optional[Tuple[object, ...]] = None
-    entries_cache: List[FileBrowserEntry] = field(default_factory=list)
+    entries_cache_key: tuple[object, ...] | None = None
+    entries_cache: list[FileBrowserEntry] = field(default_factory=list)
     entries_cache_time: float = 0.0
 
 
@@ -631,7 +630,7 @@ class FileBrowserState:
     op_cursor: int = 0
     op_label: str = ""
     op_payload: dict = field(default_factory=dict)
-    op_completion_matches: List[str] = field(default_factory=list)
+    op_completion_matches: list[str] = field(default_factory=list)
     op_completion_index: int = 0
 
 
@@ -673,7 +672,7 @@ class GotoMotion:
 # The key/motion _resolve_operator receives: either a raw curses key code
 # (int) for a simple motion, or one of the tagged dataclasses above for a
 # motion that carries extra data.
-OperatorMotion = Union[int, TextObjectMotion, FindMotion, SearchMotion, GotoMotion]
+OperatorMotion = int | TextObjectMotion | FindMotion | SearchMotion | GotoMotion
 
 
 def _per_char_case(fn: Callable[[str], str]) -> Callable[[str], str]:
@@ -692,6 +691,287 @@ _uppercase = _per_char_case(str.upper)
 
 
 # ---------------------------------------------------------------------------
+# File-browser grep scanning
+# ---------------------------------------------------------------------------
+#
+# The scan runs in a worker subprocess (see _grep_worker_main) so a regex with
+# pathological backtracking, or one that pushes the regex engine's recursion
+# past the limit, can be killed at the deadline instead of freezing the
+# editor's key loop forever. _grep_scan_tree is also usable in-process (the
+# tests pass a fake clock); every result is streamed to `emit` as it is found
+# so the parent keeps partial output even if the worker has to be killed.
+
+def _grep_split_masks(file_mask: str) -> list[str]:
+    """Split a file mask into fnmatch patterns.
+
+    Only ';' and ',' separate masks. Whitespace is part of a real filename
+    ("my notes.txt"), so it must not split a mask into pieces.
+    """
+    masks = [part.strip() for part in re.split(r"[;,]", file_mask or "")]
+    return [mask for mask in masks if mask] or ["*"]
+
+
+def _grep_mask_matches(filename: str, masks: Sequence[str]) -> bool:
+    return any(fnmatch.fnmatch(filename, mask) for mask in masks)
+
+
+def _grep_preview(text: str, start: int, end: int, preview_chars: int) -> str:
+    """Return a bounded slice of *text* that keeps the match span visible.
+
+    A matching line can be up to FB_GREP_MAX_LINE_BYTES characters long; storing
+    and redrawing thousands of such lines made a broad grep allocate gigabytes
+    and paint for tens of seconds. A short window around the match is enough to
+    identify the hit.
+    """
+    if preview_chars <= 0 or len(text) <= preview_chars:
+        return text
+    match_len = max(0, end - start)
+    if match_len >= preview_chars:
+        return text[start:start + preview_chars]
+    # Centre the match, then spend any slack at a line boundary on the other
+    # side so short matches near the start/end still get a full window.
+    before = min(start, (preview_chars - match_len) // 2)
+    after = min(len(text) - end, preview_chars - match_len - before)
+    before = min(start, preview_chars - match_len - after)
+    window = text[start - before:end + after]
+    if start - before > 0:
+        window = "..." + window
+    if end + after < len(text):
+        window = window + "..."
+    return window
+
+
+def _grep_scan_tree(
+    root: str,
+    pattern: str,
+    file_mask: str = "*",
+    include_hidden: bool = False,
+    *,
+    timeout: float = 10.0,
+    max_results: int = 5000,
+    max_line_chars: int = 1 << 20,
+    preview_chars: int = 512,
+    max_result_bytes: int = 32 * 1024 * 1024,
+    clock: Callable[[], float] = time.monotonic,
+    emit: Callable[[dict], None] | None = None,
+) -> dict:
+    """Scan *root* for *pattern*, returning a bounded, partial-safe outcome.
+
+    The returned dict has: results (List[GrepResult]), truncated, timed_out,
+    plain_text, skipped_files, skipped_lines, dir_errors, result_bytes and
+    stop_reason ("timeout", "results", "bytes" or None).
+
+    `clock` is injectable so tests can exercise the deadline without waiting;
+    the worker subprocess also provides the hard isolation a Python-level
+    deadline cannot give a regex that never returns.
+    """
+    try:
+        regex = re.compile(pattern)
+        plain_text = False
+    except (re.error, RecursionError, OverflowError):
+        # Both classes have been seen from user-entered patterns: deeply
+        # nested groups overflow the compiler's recursion limit, and an
+        # enormous repetition count raises OverflowError. Neither may crash
+        # the editor, so search for the text literally instead.
+        regex = re.compile(re.escape(pattern))
+        plain_text = True
+
+    root = os.path.abspath(root)
+    include_hidden = include_hidden or os.path.basename(root).startswith(".")
+    masks = _grep_split_masks(file_mask)
+    deadline = clock() + max(0.0, timeout)
+    max_line_chars = max(1, int(max_line_chars))
+    max_results = max(0, int(max_results))
+    max_result_bytes = max(0, int(max_result_bytes))
+
+    results: list[GrepResult] = []
+    truncated = False
+    timed_out = False
+    skipped_files = 0
+    skipped_lines = 0
+    dir_errors = 0
+    result_bytes = 0
+    stop_reason: str | None = None
+    stop_scan = False
+
+    def _hit_deadline() -> bool:
+        nonlocal truncated, timed_out, stop_reason
+        if clock() < deadline:
+            return False
+        timed_out = True
+        truncated = True
+        stop_reason = "timeout"
+        return True
+
+    def _on_walk_error(_exc: OSError) -> None:
+        # os.walk silently ignores unreadable directories without this; the
+        # user otherwise sees a confident "0 matches" for a partial scan.
+        nonlocal dir_errors
+        dir_errors += 1
+
+    def _match(text: str):
+        nonlocal regex, plain_text
+        try:
+            return regex.search(text)
+        except (RecursionError, OverflowError):
+            # A compiled pattern can still exceed the engine's limits on a
+            # particular subject. Fall back to the literal text and retry;
+            # the summary tells the UI the pattern was treated as plain text.
+            regex = re.compile(re.escape(pattern))
+            plain_text = True
+            return regex.search(text)
+
+    def _add_result(path: str, line_no: int, text: str, match) -> bool:
+        nonlocal result_bytes, truncated, stop_reason
+        preview = _grep_preview(text, match.start(), match.end(), preview_chars)
+        size = (len(preview.encode("utf-8", "replace"))
+                + len(path.encode("utf-8", "replace")) + 16)
+        if result_bytes + size > max_result_bytes:
+            truncated = True
+            stop_reason = "bytes"
+            return False
+        results.append(GrepResult(path, line_no, preview))
+        result_bytes += size
+        if emit is not None:
+            emit({"t": "r", "p": path, "n": line_no, "x": preview})
+        if len(results) >= max_results:
+            truncated = True
+            stop_reason = "results"
+            return False
+        return True
+
+    if max_results <= 0 or max_result_bytes <= 0:
+        truncated = True
+        stop_reason = "results" if max_results <= 0 else "bytes"
+    elif not _hit_deadline():
+        for dirpath, dirnames, filenames in os.walk(root, onerror=_on_walk_error):
+            if _hit_deadline():
+                break
+            if not include_hidden:
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for filename in sorted(filenames):
+                if not include_hidden and filename.startswith("."):
+                    continue
+                if not _grep_mask_matches(filename, masks):
+                    continue
+                if _hit_deadline():
+                    stop_scan = True
+                    break
+                path = os.path.join(dirpath, filename)
+                try:
+                    # `readline(n)` on a TextIOWrapper counts characters, not
+                    # bytes; the cap is still what keeps one no-newline file
+                    # from blocking the deadline check indefinitely.
+                    with _open_regular_file(path, "r", encoding="utf-8",
+                                            errors="replace") as fh:
+                        line_no = 0
+                        parts: list[str] = []
+                        overlong = False
+                        while True:
+                            if _hit_deadline():
+                                stop_scan = True
+                                break
+                            chunk = fh.readline(max_line_chars)
+                            if not chunk:
+                                break
+                            complete = (chunk.endswith("\n")
+                                        or len(chunk) < max_line_chars)
+                            if not overlong:
+                                parts.append(chunk)
+                                if not complete:
+                                    overlong = True
+                            if not complete:
+                                continue
+                            line_no += 1
+                            if overlong:
+                                # Still count (and keep scanning past) a line
+                                # too long to evaluate safely, but report that
+                                # it was skipped rather than "0 matches".
+                                skipped_lines += 1
+                            else:
+                                text = "".join(parts).rstrip("\n")
+                                match = _match(text)
+                                if match is not None and not _add_result(
+                                        path, line_no, text, match):
+                                    stop_scan = True
+                            parts = []
+                            overlong = False
+                            if stop_scan:
+                                break
+                except OSError as exc:
+                    # EINVAL is _open_regular_file rejecting a FIFO/device:
+                    # an intentional skip, not an unreadable regular file.
+                    if exc.errno != errno.EINVAL:
+                        skipped_files += 1
+                except UnicodeError:
+                    skipped_files += 1
+                if stop_scan:
+                    break
+            if stop_scan:
+                break
+
+    return {
+        "results": results,
+        "truncated": truncated,
+        "timed_out": timed_out,
+        "plain_text": plain_text,
+        "skipped_files": skipped_files,
+        "skipped_lines": skipped_lines,
+        "dir_errors": dir_errors,
+        "result_bytes": result_bytes,
+        "stop_reason": stop_reason,
+    }
+
+
+def _grep_worker_main() -> None:
+    """Grep worker entry point: one JSON request on stdin, JSONL on stdout.
+
+    Events are {"t":"r","p":path,"n":line,"x":preview} for each result,
+    {"t":"s",...summary...} after a completed scan, and {"t":"e","m":message}
+    if the scan raised. Streaming results keeps partial output usable when
+    the parent has to kill a runaway regex.
+    """
+    def emit(event: dict) -> None:
+        # ensure_ascii keeps the wire format independent of the child's
+        # locale/stdout encoding; json.loads restores the original text.
+        sys.stdout.write(json.dumps(event) + "\n")
+        sys.stdout.flush()
+
+    try:
+        raw = sys.stdin.readline()
+        request = json.loads(raw) if raw.strip() else {}
+        if not isinstance(request, dict):
+            raise TypeError("grep request must be an object")
+        outcome = _grep_scan_tree(
+            str(request.get("root", ".")),
+            str(request.get("pattern", "")),
+            str(request.get("file_mask", "*")),
+            bool(request.get("include_hidden", False)),
+            timeout=float(request.get("timeout", 10.0)),
+            max_results=int(request.get("max_results", 5000)),
+            max_line_chars=int(request.get("max_line_chars", 1 << 20)),
+            preview_chars=int(request.get("preview_chars", 512)),
+            max_result_bytes=int(request.get("max_result_bytes", 32 << 20)),
+            emit=emit,
+        )
+        emit({
+            "t": "s",
+            "truncated": outcome["truncated"],
+            "timed_out": outcome["timed_out"],
+            "plain_text": outcome["plain_text"],
+            "skipped_files": outcome["skipped_files"],
+            "skipped_lines": outcome["skipped_lines"],
+            "dir_errors": outcome["dir_errors"],
+            "stop_reason": outcome["stop_reason"],
+            "count": len(outcome["results"]),
+        })
+    except BaseException as exc:  # noqa: BLE001 - the parent must hear about any failure
+        # The parent may already be gone (broken pipe); there is no one left to tell.
+        with contextlib.suppress(BaseException):
+            emit({"t": "e", "m": f"{type(exc).__name__}: {exc}"})
+
+
+# ---------------------------------------------------------------------------
 # Editor
 # ---------------------------------------------------------------------------
 
@@ -699,6 +979,9 @@ class ViiEditor:
     TAB_STOP    = 8
     INDENT      = "    "   # 4 spaces; change to "\t" for real tabs
     MAX_UNDO    = 200
+    # Vim's own tabstop limit. One Tab of a larger tabstop or shiftwidth is
+    # millions of cells or spaces, which no draw or edit finishes.
+    MAX_INDENT_WIDTH = 9999
     # Each undo state snapshots the whole buffer (a full lines list plus a
     # full line_endings list), so on huge files a deep stack can pin GBs of
     # list overhead. Cap the aggregate snapshot-lines retained across the
@@ -726,7 +1009,7 @@ class ViiEditor:
     HEX_VIEW_MAX_BYTES = 64 * 1024 * 1024
     SESSION_PATH = os.path.expanduser("~/.vii_session")
     SESSION_MAX_FILES = 10
-    IGNORED_CONTROL_KEYS = {3, 28}  # Ctrl-C, Ctrl-\ / Ctrl-4
+    IGNORED_CONTROL_KEYS: ClassVar[set[int]] = {3, 28}  # Ctrl-C, Ctrl-\ / Ctrl-4
     CHROME_ROWS = 3  # top chrome line + status line + bottom message line
     SYNTAX_PAIR_COMMENT = 1
     SYNTAX_PAIR_STRING  = 2
@@ -755,18 +1038,26 @@ class ViiEditor:
     # place, so cached sizes/dates are re-read at most this old.
     FB_ENTRIES_MAX_AGE_SECONDS = 2.0
     FB_GREP_TIMEOUT_SECONDS = 10.0
+    FB_GREP_WORKER_GRACE_SECONDS = 1.0
     FB_GREP_MAX_RESULTS = 5000
+    # TextIOWrapper.readline(n) counts characters, not bytes; the name is
+    # retained for compatibility, the cap is a character count.
     FB_GREP_MAX_LINE_BYTES = 1 << 20
+    # Store/redraw only a window around each match, and cap the total bytes
+    # kept in grep_results. Without these, 5000 full-length (up to 1 MiB)
+    # matching lines could retain gigabytes and take tens of seconds to paint.
+    FB_GREP_PREVIEW_CHARS = 512
+    FB_GREP_MAX_RESULT_BYTES = 32 * 1024 * 1024
     # Copy/move/delete run shutil calls synchronously in the key handler
-    # (like the grep walk, there's no way to cancel mid-operation), so
-    # above these sizes warn and require confirmation before blocking the
-    # whole UI for however long the operation takes.
+    # (there's no way to cancel mid-operation), so above these sizes warn and
+    # require confirmation before blocking the whole UI for however long the
+    # operation takes.
     FB_LARGE_OP_WARN_BYTES = 200 * 1024 * 1024
     FB_LARGE_OP_WARN_COUNT = 2000
-    BRACKET_PAIRS = {"(": ")", ")": "(", "[": "]", "]": "[", "{": "}", "}": "{"}
+    BRACKET_PAIRS: ClassVar[dict[str, str]] = {"(": ")", ")": "(", "[": "]", "]": "[", "{": "}", "}": "{"}
     OPEN_BRACKETS = frozenset("([{")
 
-    _COLOR_NAMES = {
+    _COLOR_NAMES: ClassVar[dict[str, int]] = {
         "black":   0,   # curses.COLOR_BLACK
         "red":     1,   # curses.COLOR_RED
         "green":   2,   # curses.COLOR_GREEN
@@ -792,7 +1083,7 @@ class ViiEditor:
             return
         object.__setattr__(self, name, value)
 
-    SYNTAX_EXTENSIONS = {
+    SYNTAX_EXTENSIONS: ClassVar[dict[str, str]] = {
         ".c": "c", ".h": "c", ".cc": "c", ".cpp": "c", ".cxx": "c", ".hpp": "c",
         ".py": "python", ".pyw": "python",
         ".tcl": "tcl",
@@ -804,7 +1095,7 @@ class ViiEditor:
         ".lisp": "lisp", ".lsp": "lisp", ".cl": "lisp", ".el": "lisp", ".scm": "lisp",
         ".fs": "forth", ".fth": "forth", ".4th": "forth", ".forth": "forth",
     }
-    SYNTAX_KEYWORDS = {
+    SYNTAX_KEYWORDS: ClassVar[dict[str, set[str]]] = {
         "c": {
             "auto", "break", "case", "char", "const", "continue", "default", "do",
             "double", "else", "enum", "extern", "float", "for", "goto", "if",
@@ -879,7 +1170,7 @@ class ViiEditor:
             "marker", "vocabulary",
         },
     }
-    SYNTAX_TYPES = {
+    SYNTAX_TYPES: ClassVar[dict[str, set[str]]] = {
         "c": {
             "bool", "char", "double", "enum", "float", "int", "long", "short",
             "signed", "struct", "union", "unsigned", "void", "_Bool",
@@ -914,7 +1205,7 @@ class ViiEditor:
             "cell", "cells", "char", "chars", "double", "float",
         },
     }
-    SYNTAX_BUILTINS = {
+    SYNTAX_BUILTINS: ClassVar[dict[str, set[str]]] = {
         "c": {
             "NULL", "calloc", "free", "malloc", "memcpy", "memset", "printf",
             "snprintf", "stderr", "stdin", "stdout", "strcmp", "strlen",
@@ -999,12 +1290,16 @@ class ViiEditor:
     _RE_GO_FUNC       = re.compile(
         r"\bfunc\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\("
     )
+    # The return-type prefix is one run, not a repeated group: whitespace is
+    # both inside and after each piece, so "(?:...\s+)+" could split a run of
+    # words exponentially many ways and froze drawing on lines such as
+    # "int v0, v1, ..., v25;". One run accepts exactly the same lines.
     _RE_CLIKE_FUNC    = re.compile(
         r"^\s*(?!(?:if|for|while|switch|catch|foreach|using|return|sizeof)\b)"
-        r"(?:[A-Za-z_][A-Za-z0-9_:<>\[\],~*&.\s]+\s+)+"
+        r"[A-Za-z_][A-Za-z0-9_:<>\[\],~*&.\s]+\s+"
         r"([A-Za-z_~][A-Za-z0-9_:~]*)\s*\([^;]*\)\s*(?:const\s*)?(?:throws\s+[A-Za-z0-9_.,\s]+)?(?:\{|$)"
     )
-    LOG_TYPES = {"python", "lnx_auth", "http", "flask", "generic"}
+    LOG_TYPES: ClassVar[set[str]] = {"python", "lnx_auth", "http", "flask", "generic"}
     _RE_LOG_LEVEL = re.compile(r"\b(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\b")
     _RE_LOG_IP = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
     _RE_LOG_DIGITS = re.compile(r"\b\d+\b")
@@ -1093,7 +1388,7 @@ class ViiEditor:
     _PASTE_START_TAIL     = "[200~"
     _PASTE_END_TAIL       = "[201~"
 
-    HELP_LINES  = [
+    HELP_LINES: ClassVar[list[str]] = [
         "vii help",
         "",
         "Movement",
@@ -1236,9 +1531,9 @@ class ViiEditor:
         "  :                    go to directory; prompts path (Tab completes subdirs)",
         "  Insert / Space       mark entry for multi-open",
         "  s  r                 cycle sort order / reverse",
-        "  g                    grep current panel (or selected dir); prompts pattern, file mask",
+        "  g                    grep current panel (or selected dir); masks: *.py;*.txt, ESC cancels",
         "  F1 Help              open help screen",
-        "  F2 Grep              grep current panel directory",
+        "  F2 Grep              grep current panel (or selected dir); same as g",
         "  F3 View              open file (binary -> hex view)",
         "  F4 Edit              open file (or marked files)",
         "  F5 Copy              copy entry / marked into other panel; prompts dest",
@@ -1373,20 +1668,25 @@ class ViiEditor:
         "  -ro  --read-only     no file saves, no session save (implies -ns)",
     ]
 
-    def __init__(self, filename: Optional[Union[str, List[str]]] = None):
+    def __init__(self, filename: str | list[str] | None = None):
         filenames = [filename] if isinstance(filename, str) else list(filename or [])
         first_filename = filenames[0] if filenames else None
         self._buffer_id = object()
         self._mutation_lang_key: object = None
         self._mutation_lang_clike = False
+        # Saved content forms of mapped file signatures (_ensure_content_baseline)
+        # and saved buffer contents for the cheap modified check, both keyed
+        # by the saved signature they stand for.
+        self._mapped_signature_aliases: dict = {}
+        self._saved_contents: dict = {}
         self.filename   = None
-        self.lines: Union[List[str], MMapLineStore] = [""]
-        self.line_endings: List[str] = [""]
+        self.lines: list[str] | MMapLineStore = [""]
+        self.line_endings: list[str] = [""]
         self.line_endings_trusted = False
-        self.log_type: Optional[str] = None
+        self.log_type: str | None = None
         self.cursor_row = 0
         self.cursor_col = 0
-        self._wanted_col: Optional[int] = None
+        self._wanted_col: int | None = None
         self.mode       = Mode.NORMAL
         self._modified  = False
         self._saved_signature = self._line_signature(
@@ -1400,22 +1700,22 @@ class ViiEditor:
         self.message_is_error = False
         self._cmd_buf         = ""      # : or / or ? or \ buffer
         self._cmd_cursor      = 0
-        self._cmd_history: dict[str, List[str]] = {":": [], "/": [], "?": [], "\\": []}
-        self._cmd_history_index: Optional[int] = None
+        self._cmd_history: dict[str, list[str]] = {":": [], "/": [], "?": [], "\\": []}
+        self._cmd_history_index: int | None = None
         self._cmd_history_draft = ""
         self._cmd_history_max = 100
-        self._filename_completion_matches: List[str] = []
+        self._filename_completion_matches: list[str] = []
         self._filename_completion_index = 0
         self._filename_completion_prefix = ""
         self._filename_completion_needs_space = False
-        self._set_completion_matches: List[str] = []
+        self._set_completion_matches: list[str] = []
         self._set_completion_index = 0
         self._set_completion_prefix = ""
-        self._intellisense_completion_matches: List[str] = []
+        self._intellisense_completion_matches: list[str] = []
         self._intellisense_completion_index = 0
         self._intellisense_completion_prefix = ""
         self._intellisense_completion_complete = False
-        self._intellisense_completion_context: Optional[Tuple[int, int]] = None
+        self._intellisense_completion_context: tuple[int, int] | None = None
         # line text -> tuple of words; line strings are immutable and reused
         # across keystrokes, so unchanged rows skip the regex scan entirely.
         self._intellisense_line_words: dict = {}
@@ -1436,7 +1736,7 @@ class ViiEditor:
         # Screen-buffer for dirty tracking
         self._last_h: int        = 0
         self._last_w: int        = 0
-        self._screen_buf: List[str] = []
+        self._screen_buf: list[str] = []
         self._force_redraw       = True
         self._hide_cursor_next_draw = False
         self._last_marked_rows: set[int] = set()
@@ -1463,8 +1763,8 @@ class ViiEditor:
         # reassignment to invalidate the cache another way.
         self._bracket_match_cache: dict = {}
         self._content_revision = 0
-        self._breadcrumb_cache_key: Optional[Tuple[object, ...]] = None
-        self._breadcrumb_cache_value: List[str] = []
+        self._breadcrumb_cache_key: tuple[object, ...] | None = None
+        self._breadcrumb_cache_value: list[str] = []
 
         # Command parsing
         self._count_str  = ""   # accumulated digit prefix
@@ -1479,15 +1779,15 @@ class ViiEditor:
         self.last_sub_pattern = ""
         self.last_sub_repl = ""
         self.last_sub_flags = ""
-        self._sub_confirm_span: Optional[Tuple[int, int, int]] = None  # (row, byte_start, byte_end)
+        self._sub_confirm_span: tuple[int, int, int] | None = None  # (row, byte_start, byte_end)
 
         # Yank
-        self.yank_buffer: List[str] = []
+        self.yank_buffer: list[str] = []
         self.yank_is_lines          = True
-        self.yank_line_endings: List[str] = []
+        self.yank_line_endings: list[str] = []
         self.registers = {'"': ([], True)}
         self.register_line_endings = {'"': []}
-        self.active_register: Optional[str] = None
+        self.active_register: str | None = None
         # Blockwise (Ctrl-V) yanks/deletes keep the (text, is_lines) register
         # shape -- one string per row, is_lines False -- and are flagged here
         # so p/P know to paste them as a column instead of as charwise text.
@@ -1495,21 +1795,21 @@ class ViiEditor:
         self.block_registers: set[str] = set()
 
         # Visual mode
-        self.visual_start: Tuple[int, int] = (0, 0)
+        self.visual_start: tuple[int, int] = (0, 0)
         # Virtual block endpoints survive vertical motion through tabs/short
         # rows, and corner swaps where no source character occupies the cell.
-        self._block_anchor_extent: Optional[Tuple[int, int]] = None
-        self._block_cursor_extent: Optional[Tuple[int, int]] = None
+        self._block_anchor_extent: tuple[int, int] | None = None
+        self._block_cursor_extent: tuple[int, int] | None = None
         # Ctrl-V block extends to the end of every row after `$`.
         self._block_to_eol = False
         # Pending blockwise I/A/c: replicated onto the other rows on ESC.
-        self._block_insert: Optional[dict] = None
+        self._block_insert: dict | None = None
         # (row, indent) when Enter / o / O just copied indent onto an
         # otherwise empty line; see _take_unused_autoindent.
-        self._autoindent_pending: Optional[Tuple[int, str]] = None
-        self.marks: dict[str, Tuple[int, int]] = {}
+        self._autoindent_pending: tuple[int, str] | None = None
+        self.marks: dict[str, tuple[int, int]] = {}
         self.auto_marks: dict[int, int] = {}   # {id: current_line}; id is an opaque unique key (see _set_auto_mark)
-        self.last_jump: Optional[Tuple[int, int]] = None
+        self.last_jump: tuple[int, int] | None = None
 
         # Keys speculatively read (and not consumed) while probing whether an
         # ESC begins a bracketed-paste marker; drained by _read_key() before
@@ -1519,18 +1819,19 @@ class ViiEditor:
         # Undo / redo
         self.undo_stack: deque = deque()
         self.redo_stack: deque = deque()
-        self._insert_pre_state: Optional[UndoState] = None
+        self._insert_pre_state: UndoState | None = None
         self._insert_pre_revision: int = 0
-        self._insert_replay_keys: List[Union[int, str]] = []
+        self._insert_replay_keys: list[int | str] = []
         self._insert_replay_mode = Mode.INSERT
-        self._insert_replay_setup: Optional[Callable[[], None]] = None
-        self._insert_empty_replay: Optional[Callable[[int], None]] = None
+        self._insert_arrow_used = False
+        self._insert_replay_setup: Callable[[], None] | None = None
+        self._insert_empty_replay: Callable[[int], None] | None = None
         self._insert_repeat_count = 1
-        self._replace_overwritten: List[Tuple[int, int, Optional[str]]] = []
+        self._replace_overwritten: list[tuple[int, int, str | None]] = []
         self._last_change = None
         self._repeat_active = False
-        self._pending_confirmation: Optional[Tuple[str, Callable[[], bool]]] = None
-        self._cmd_context: Optional[Tuple[str, object]] = None
+        self._pending_confirmation: tuple[str, Callable[[], bool]] | None = None
+        self._cmd_context: tuple[str, object] | None = None
         self.help_top_line = 0
         self.help_search_pattern = ""
         self.help_search_forward = True
@@ -1546,13 +1847,13 @@ class ViiEditor:
         self._line_endings_convert_on_save = False  # cached likewise
         self._overlay_pending_g = False    # first "g" of gg seen in a scroll overlay
         self.shell_top_line = 0
-        self.shell_lines: List[str] = []
+        self.shell_lines: list[str] = []
         self.shell_command_label = ""
         self.last_shell_cmd = ""
         self.buffer_list_top_line = 0
         self.buffer_list_cursor = 0
         self.buffer_list_number = ""
-        self.recent_files_list: List[str] = []
+        self.recent_files_list: list[str] = []
         self.recent_files_cursor = 0
         self.recent_files_top_line = 0
         self.recent_files_number = ""
@@ -1561,19 +1862,19 @@ class ViiEditor:
             FileBrowserPanel(start_dir),
             FileBrowserPanel(start_dir),
         )
-        self.grep_results: List[GrepResult] = []
+        self.grep_results: list[GrepResult] = []
         self.grep_result_cursor = 0
         self.grep_result_top_line = 0
         self.grep_result_number = ""
         self.grep_result_label = ""
-        self.function_list: List[Tuple[int, str]] = []
+        self.function_list: list[tuple[int, str]] = []
         self.function_list_cursor = 0
         self.function_list_top_line = 0
         self.function_list_search: str = ""
         self.function_list_searching: bool = False
-        self.buffers: List[BufferState] = []
+        self.buffers: list[BufferState] = []
         self.current_buffer = 0
-        self._session_cache: Optional[dict] = None  # loaded lazily, reset on save
+        self._session_cache: dict | None = None  # loaded lazily, reset on save
 
         # Last f/F/t/T
         self._last_find_char = ""
@@ -1629,6 +1930,10 @@ class ViiEditor:
 
         # curses window; set by run() so that color-change :set opts can reinit pairs
         self._stdscr = None
+        # True only while edit()'s key loop is running. Long synchronous
+        # operations use it to decide whether they may poll curses for Esc and
+        # repaint progress; tests and headless calls must not touch the screen.
+        self._in_event_loop = False
 
         self._load_viirc()
 
@@ -1658,7 +1963,7 @@ class ViiEditor:
         """Return the string inserted by one indent step (Tab key, > operator)."""
         return " " * self.shift_width if self.expand_tab else "\t"
 
-    def _default_line_ending_name(self, ending: Optional[str] = None) -> str:
+    def _default_line_ending_name(self, ending: str | None = None) -> str:
         """Name of `ending` (the current buffer's when omitted)."""
         ending = self.default_line_ending if ending is None else ending
         return "windows" if ending == "\r\n" else "unix"
@@ -1677,7 +1982,7 @@ class ViiEditor:
         self.default_line_ending = ending
         return ""
 
-    def _detect_line_ending(self, endings: List[str]) -> str:
+    def _detect_line_ending(self, endings: list[str]) -> str:
         """A file whose line breaks are all LF or all CRLF keeps that ending;
         a mixed file (or one with no breaks) takes the lnendings option."""
         seen = set(endings)
@@ -1837,23 +2142,25 @@ class ViiEditor:
             if key in ("tabstop", "ts"):
                 try:
                     v = int(raw)
-                    if v < 1:
+                    if not 1 <= v <= self.MAX_INDENT_WIDTH:
                         raise ValueError
                     self.tab_stop = v
                     self._force_redraw = True
                     return ""
                 except ValueError:
-                    return f"tabstop must be a positive integer: {raw!r}"
+                    return (f"tabstop must be an integer from 1 to "
+                            f"{self.MAX_INDENT_WIDTH}: {raw!r}")
 
             if key in ("shiftwidth", "sw"):
                 try:
                     v = int(raw)
-                    if v < 1:
+                    if not 1 <= v <= self.MAX_INDENT_WIDTH:
                         raise ValueError
                     self.shift_width = v
                     return ""
                 except ValueError:
-                    return f"shiftwidth must be a positive integer: {raw!r}"
+                    return (f"shiftwidth must be an integer from 1 to "
+                            f"{self.MAX_INDENT_WIDTH}: {raw!r}")
 
             if key in ("undolevels", "ul"):
                 try:
@@ -1980,25 +2287,24 @@ class ViiEditor:
     def _is_ignored_control_key(cls, key: int) -> bool:
         return key in cls.IGNORED_CONTROL_KEYS
 
-    def _extract_functions(self) -> List[Tuple[int, str]]:
+    def _extract_functions(self) -> list[tuple[int, str]]:
         """Scan all lines and return (line_no, label) for each function/class/heading."""
         lang = self._syntax_language()
-        results: List[Tuple[int, str]] = []
+        results: list[tuple[int, str]] = []
         for lnum, line in enumerate(self.lines):
             label = self._parse_function_line(line, lang)
             if label:
                 results.append((lnum, label))
         return results
 
-    def _parse_function_line(self, line: str, syntax: Optional[str]) -> Optional[str]:
+    def _parse_function_line(self, line: str, syntax: str | None) -> str | None:
         """Return a label string if this line declares a function/class/heading, else None."""
         stripped = line.strip()
         if not stripped:
             return None
         # Markdown headings start with '#' — do NOT skip them as comments.
         # For all other syntaxes '#' is a comment character.
-        if syntax != "markdown" and (stripped.startswith('#') or stripped.startswith('//')
-                                      or stripped.startswith(';')):
+        if syntax != "markdown" and stripped.startswith(('#', '//', ';')):
             return None
 
         if syntax == "python":
@@ -2028,11 +2334,11 @@ class ViiEditor:
                 m = self._RE_C_ENUM.match(stripped)
                 if m:
                     return f"enum {m.group(1)}"
-            elif '(' in stripped and '{' in line:
-                if not any(stripped.startswith(kw) for kw in ('if', 'while', 'for', 'switch', 'catch', '#')):
-                    m = self._RE_C_FUNC.search(line)
-                    if m and m.group(1) not in ('if', 'while', 'for', 'switch', 'catch'):
-                        return m.group(1)
+            elif ('(' in stripped and '{' in line
+                  and not stripped.startswith(('if', 'while', 'for', 'switch', 'catch', '#'))):
+                m = self._RE_C_FUNC.search(line)
+                if m and m.group(1) not in ('if', 'while', 'for', 'switch', 'catch'):
+                    return m.group(1)
 
         elif syntax in ("js", "ts"):
             if stripped.startswith('async function '):
@@ -2087,17 +2393,16 @@ class ViiEditor:
             if m:
                 return f": {m.group(1)}"
 
-        elif syntax == "markdown":
-            if stripped.startswith('#'):
-                depth = len(stripped) - len(stripped.lstrip('#'))
-                if 0 < depth <= 6:
-                    text = stripped[depth:].strip()
-                    if text:
-                        return f"{'#' * depth} {text[:60]}"
+        elif syntax == "markdown" and stripped.startswith('#'):
+            depth = len(stripped) - len(stripped.lstrip('#'))
+            if 0 < depth <= 6:
+                text = stripped[depth:].strip()
+                if text:
+                    return f"{'#' * depth} {text[:60]}"
 
         return None
 
-    def _filtered_function_list(self) -> List[Tuple[int, str]]:
+    def _filtered_function_list(self) -> list[tuple[int, str]]:
         if not self.function_list_search:
             return self.function_list
         q = self.function_list_search.lower()
@@ -2203,21 +2508,21 @@ set errorcolor=black          " error message text colour on the bottom line
         if not os.path.isfile(rc_path):
             self._write_default_viirc(rc_path)
         try:
-            fh = open(rc_path, encoding="utf-8", errors="replace")
+            with open(rc_path, encoding="utf-8", errors="replace") as fh:
+                rc_lines = fh.readlines()
         except OSError:
             return
-        with fh:
-            for raw in fh:
-                line = raw.split('"', 1)[0].strip()
-                if not line or line.startswith('"'):
-                    continue
-                if line.startswith("set "):
-                    for opt in line[4:].split():
-                        self._apply_set_opt(opt)
-                elif line == "set":
-                    pass  # bare "set" with no args — nothing to do at load time
-                elif line.startswith("lnendings="):
-                    self._apply_set_opt(line)
+        for raw in rc_lines:
+            line = raw.split('"', 1)[0].strip()
+            if not line or line.startswith('"'):
+                continue
+            if line.startswith("set "):
+                for opt in line[4:].split():
+                    self._apply_set_opt(opt)
+            elif line == "set":
+                pass  # bare "set" with no args — nothing to do at load time
+            elif line.startswith("lnendings="):
+                self._apply_set_opt(line)
 
     # -----------------------------------------------------------------------
     # Session save / restore
@@ -2279,22 +2584,20 @@ set errorcolor=black          " error message text colour on the bottom line
         write back. Best-effort: if the lock file can't even be opened, fall
         through and proceed unlocked rather than fail the whole save.
         """
+        def unlock(fh):
+            with contextlib.suppress(OSError):
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
         lock_path = self.SESSION_PATH + ".lock"
-        lock_fh = None
-        try:
-            lock_fh = open(lock_path, "a")
-            fcntl.flock(lock_fh, fcntl.LOCK_EX)
-        except OSError:
-            lock_fh = None
-        try:
+        with contextlib.ExitStack() as stack:
+            try:
+                lock_fh = stack.enter_context(open(lock_path, "a"))
+                fcntl.flock(lock_fh, fcntl.LOCK_EX)
+            except OSError:
+                pass  # proceed unlocked; the stack still closes an opened file
+            else:
+                stack.callback(unlock, lock_fh)
             yield
-        finally:
-            if lock_fh is not None:
-                try:
-                    fcntl.flock(lock_fh, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                lock_fh.close()
 
     def _apply_session_cursor(self, filename: str) -> bool:
         """Move cursor/marks to the saved state for *filename* if one exists."""
@@ -2324,7 +2627,7 @@ set errorcolor=black          " error message text colour on the bottom line
             buf.marks.pop(">", None)
         self._force_redraw = True
 
-    def _clamp_session_marks(self, marks: dict[str, Tuple[int, int]]) -> dict[str, Tuple[int, int]]:
+    def _clamp_session_marks(self, marks: dict[str, tuple[int, int]]) -> dict[str, tuple[int, int]]:
         clamped = {}
         for name, (row, col) in marks.items():
             if not (len(name) == 1 and (name.isalpha() or name in "<>")):
@@ -2357,7 +2660,7 @@ set errorcolor=black          " error message text colour on the bottom line
             for id_, cur in self.auto_marks.items()
         }
 
-    def _edit_positions(self) -> dict[Optional[str], Tuple[int, int]]:
+    def _edit_positions(self) -> dict[str | None, tuple[int, int]]:
         """Named marks and the jump position share every edit transform.
 
         None is an internal key only; it is never stored in self.marks or
@@ -2368,7 +2671,7 @@ set errorcolor=black          " error message text colour on the bottom line
             positions[None] = self.last_jump
         return positions
 
-    def _set_edit_positions(self, positions: dict[Optional[str], Tuple[int, int]]):
+    def _set_edit_positions(self, positions: dict[str | None, tuple[int, int]]):
         self.last_jump = positions.pop(None, None)
         self.marks = positions
 
@@ -2484,7 +2787,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._set_edit_positions(adjusted)
 
     def _adjust_marks_for_line_matches(
-            self, row: int, spans: List[Tuple[int, int, str]]):
+            self, row: int, spans: list[tuple[int, int, str]]):
         """Precise sibling of _adjust_marks_for_line_replace for a line with
         several separate substitutions applied in one pass (:s///g). `spans`
         are the (old_start, old_end, replacement_text) of each match, in
@@ -2515,7 +2818,7 @@ set errorcolor=black          " error message text colour on the bottom line
             adjusted[name] = (mark_row, col)
         self._set_edit_positions(adjusted)
 
-    def _remap_marks_for_row_split(self, row: int, new_lines: List[str]):
+    def _remap_marks_for_row_split(self, row: int, new_lines: list[str]):
         """Follow-up to _adjust_marks_for_line_replace/_adjust_marks_for_line_matches
         for a :s replacement that embedded a literal newline and split `row`
         into multiple lines. Those two helpers compute each mark's column as
@@ -2557,7 +2860,7 @@ set errorcolor=black          " error message text colour on the bottom line
     PROJECT_SECTION_PREFIX = "# project: "
 
     @staticmethod
-    def _read_raw_session_mru_lines(session_path: str) -> List[str]:
+    def _read_raw_session_mru_lines(session_path: str) -> list[str]:
         """Raw lines of *session_path* up to (not including) the first project
         section header, preserved byte-for-byte so project save/delete only
         ever touches the project-section part of the file.
@@ -2573,7 +2876,7 @@ set errorcolor=black          " error message text colour on the bottom line
         to rewrite the file must not mistake "couldn't read it" for "there
         was nothing to preserve" and silently overwrite real content.
         """
-        lines: List[str] = []
+        lines: list[str] = []
         try:
             with open(session_path, "r", encoding="utf-8", errors="replace") as fh:
                 for raw in fh:
@@ -2586,7 +2889,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return lines or ["# vii session"]
 
     @staticmethod
-    def _read_project_sections(session_path: str) -> dict[str, List[str]]:
+    def _read_project_sections(session_path: str) -> dict[str, list[str]]:
         """Return {project_name: [abspath, ...]} parsed from *session_path*.
 
         Project entries are bare JSON-encoded path strings (no trailing
@@ -2598,8 +2901,8 @@ set errorcolor=black          " error message text colour on the bottom line
         the path is taken as a parameter instead of read off cls/self, and
         why only FileNotFoundError (not every OSError) is treated as empty.
         """
-        sections: dict[str, List[str]] = {}
-        current: Optional[str] = None
+        sections: dict[str, list[str]] = {}
+        current: str | None = None
         try:
             with open(session_path, "r", encoding="utf-8", errors="replace") as fh:
                 for raw in fh:
@@ -2625,7 +2928,7 @@ set errorcolor=black          " error message text colour on the bottom line
             pass
         return sections
 
-    def _atomic_write_session_lines(self, out: List[str]) -> bool:
+    def _atomic_write_session_lines(self, out: list[str]) -> bool:
         """Returns True on success. Callers must check this -- a failed write
         must not be reported to the user as a completed save/delete."""
         # A unique temp name keeps concurrently exiting editor instances from
@@ -2661,7 +2964,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._session_cache = None  # invalidate so next load re-reads
         return success
 
-    def _write_project_sections(self, sections: dict[str, List[str]]) -> bool:
+    def _write_project_sections(self, sections: dict[str, list[str]]) -> bool:
         """Rewrite SESSION_PATH, keeping the MRU portion untouched and
         replacing the project-sections portion with *sections*. Returns False
         (without writing anything) if the existing MRU portion couldn't be
@@ -2681,11 +2984,11 @@ set errorcolor=black          " error message text colour on the bottom line
             out.extend(json.dumps(p, ensure_ascii=True) for p in paths)
         return self._atomic_write_session_lines(out)
 
-    def _named_buffer_paths(self) -> List[str]:
+    def _named_buffer_paths(self) -> list[str]:
         """Absolute paths of every named buffer, current buffer first, deduped."""
         self._sync_current_buffer()
         seen: set = set()
-        paths: List[str] = []
+        paths: list[str] = []
         if not self.buffers:
             return paths
         current = max(0, min(self.current_buffer, len(self.buffers) - 1))
@@ -2722,7 +3025,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self.message = f"Project '{name}' saved ({len(paths)} file{'s' if len(paths) != 1 else ''})"
         self.message_is_error = False
 
-    def _load_project_files(self, name: str, paths: List[str]) -> None:
+    def _load_project_files(self, name: str, paths: list[str]) -> None:
         existing = [p for p in paths if os.path.isfile(p)]
         missing = len(paths) - len(existing)
         if not existing:
@@ -2825,7 +3128,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return
         self._sync_current_buffer()
         seen: set = set()
-        entries: List[Tuple[str, int, int, dict, dict]] = []
+        entries: list[tuple[str, int, int, dict, dict]] = []
         if self.buffers:
             current = max(0, min(self.current_buffer, len(self.buffers) - 1))
             ordered = (
@@ -2889,7 +3192,7 @@ set errorcolor=black          " error message text colour on the bottom line
 
             self._atomic_write_session_lines(out)
 
-    def _dump_crash_recovery(self) -> List[str]:
+    def _dump_crash_recovery(self) -> list[str]:
         """Best-effort dump of every modified buffer before an unexpected crash.
 
         Named buffers dump to <file>.vii_crash next to the original; unnamed
@@ -2897,11 +3200,10 @@ set errorcolor=black          " error message text colour on the bottom line
         Never raises: this runs while an exception is already propagating and
         must not mask it.
         """
-        written: List[str] = []
-        try:
+        written: list[str] = []
+        # Never raise while a crash is unwinding: dump whatever is reachable.
+        with contextlib.suppress(Exception):
             self._sync_current_buffer()
-        except Exception:
-            pass
         unnamed = 0
         for b in getattr(self, "buffers", []):
             try:
@@ -2923,7 +3225,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 with open(dump_path, "w", encoding="utf-8", newline="") as fh:
                     fh.write(text)
                 written.append(dump_path)
-            except Exception:
+            except Exception:  # noqa: BLE001, S112 - one bad buffer must not stop the rest
                 continue
         return written
 
@@ -2977,7 +3279,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 self._screen_buf[slot] = ""
 
     @staticmethod
-    def _line_signature(lines, line_endings: Optional[List[str]] = None) -> Tuple[str, str]:
+    def _line_signature(lines, line_endings: list[str] | None = None) -> tuple[str, str]:
         digest = hashlib.blake2b(digest_size=16)
         try:
             line_count = len(lines)
@@ -2997,7 +3299,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return ("lines", digest.hexdigest())
 
     @staticmethod
-    def _line_endings_signature(line_endings: List[str]) -> str:
+    def _line_endings_signature(line_endings: list[str]) -> str:
         digest = hashlib.blake2b(digest_size=16)
         digest.update(b"E1")
         empty_len = (0).to_bytes(8, "big")
@@ -3009,11 +3311,11 @@ set errorcolor=black          " error message text colour on the bottom line
         return digest.hexdigest()
 
     @staticmethod
-    def _split_bytes_with_line_endings(data: bytes, encoding: str = "utf-8") -> Tuple[List[str], List[str]]:
+    def _split_bytes_with_line_endings(data: bytes, encoding: str = "utf-8") -> tuple[list[str], list[str]]:
         if not data:
             return [""], [""]
-        lines: List[str] = []
-        endings: List[str] = []
+        lines: list[str] = []
+        endings: list[str] = []
         for part in data.splitlines(keepends=True):
             if part.endswith(b"\r\n"):
                 body = part[:-2]
@@ -3035,16 +3337,16 @@ set errorcolor=black          " error message text colour on the bottom line
         return lines, endings
 
     @staticmethod
-    def _file_signature(filename: str) -> Tuple[str, str, int, int]:
+    def _file_signature(filename: str) -> tuple[str, str, int, int]:
         st = os.stat(filename)
         return ("file", os.path.abspath(filename), st.st_size, st.st_mtime_ns)
 
     @staticmethod
-    def _signature_filename(filename: Optional[str]) -> Optional[str]:
+    def _signature_filename(filename: str | None) -> str | None:
         return ViiEditor._normalize_path(filename)
 
     @staticmethod
-    def _normalize_path(filename: Optional[str]) -> Optional[str]:
+    def _normalize_path(filename: str | None) -> str | None:
         if not filename:
             return None
         return os.path.abspath(os.path.expanduser(filename))
@@ -3073,8 +3375,8 @@ set errorcolor=black          " error message text colour on the bottom line
         return False
 
     @classmethod
-    def _paths_refer_to_same_file(cls, first: Optional[str],
-                                  second: Optional[str]) -> bool:
+    def _paths_refer_to_same_file(cls, first: str | None,
+                                  second: str | None) -> bool:
         first_path = cls._normalize_path(first)
         second_path = cls._normalize_path(second)
         if not first_path or not second_path:
@@ -3087,7 +3389,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return False
 
     @classmethod
-    def _file_signature_or_none(cls, filename: Optional[str]) -> Optional[Tuple[str, str, int, int]]:
+    def _file_signature_or_none(cls, filename: str | None) -> tuple[str, str, int, int] | None:
         if not filename:
             return None
         try:
@@ -3095,21 +3397,29 @@ set errorcolor=black          " error message text colour on the bottom line
         except OSError:
             return None
 
-    def _current_signature(self, line_endings: Optional[List[str]] = None):
+    def _current_signature(self, line_endings: list[str] | None = None):
         line_endings = self.line_endings if line_endings is None else line_endings
         filename_sig = self._signature_filename(self.filename)
         if isinstance(self.lines, MMapLineStore) and self.lines.is_mapped:
             file_part = self._mapped_file_part(self._saved_signature, self.lines.filename)
             if file_part is not None:
-                return file_part + (
+                return self._unalias_mapped_signature(file_part + (
                     self._line_endings_signature(line_endings),
                     self.line_endings_trusted,
                     filename_sig,
-                )
+                ), self._saved_signature)
         return self._line_signature(self.lines, line_endings) + (
             self.line_endings_trusted,
             filename_sig,
         )
+
+    def _unalias_mapped_signature(self, signature: tuple, saved_signature) -> tuple:
+        """The saved content-form signature when `signature` is the file form
+        it was converted from by _ensure_content_baseline -- a mapped buffer
+        no edit has touched still holds exactly that content."""
+        if self._mapped_signature_aliases.get(saved_signature) == signature:
+            return saved_signature
+        return signature
 
     def _mapped_file_part(self, saved_signature, filename: str):
         """The ("file", path, size, mtime) head of a still-mapped buffer's
@@ -3137,11 +3447,11 @@ set errorcolor=black          " error message text colour on the bottom line
         if isinstance(b.lines, MMapLineStore) and b.lines.is_mapped:
             file_part = self._mapped_file_part(b.saved_signature, b.lines.filename)
             if file_part is not None:
-                return file_part + (
+                return self._unalias_mapped_signature(file_part + (
                     self._line_endings_signature(b.line_endings),
                     b.line_endings_trusted,
                     filename_sig,
-                )
+                ), b.saved_signature)
         return self._line_signature(b.lines, b.line_endings) + (
             b.line_endings_trusted,
             filename_sig,
@@ -3149,6 +3459,9 @@ set errorcolor=black          " error message text colour on the bottom line
 
     def _mark_clean(self):
         self._saved_signature = self._current_signature()
+        self._remember_saved_content(
+            self._saved_signature, self.lines, self.line_endings,
+            self.line_endings_trusted, self._signature_filename(self.filename))
         self._saved_file_signature = self._file_signature_or_none(self.filename)
         self.modified = False
 
@@ -3176,19 +3489,73 @@ set errorcolor=black          " error message text colour on the bottom line
         self._insert_replay_setup = None
         self._insert_empty_replay = None
 
-    def _ensure_content_baseline(self, snapshot: Optional[List[str]] = None,
-                                 line_endings: Optional[List[str]] = None):
+    def _ensure_content_baseline(self, snapshot: list[str] | None = None,
+                                 line_endings: list[str] | None = None):
         if isinstance(self._saved_signature, tuple) and self._saved_signature[:1] == ("file",):
-            self._saved_signature = self._line_signature(
-                snapshot if snapshot is not None else self.lines,
-                line_endings if line_endings is not None else self.line_endings,
-            ) + (
-                self.line_endings_trusted,
-                self._signature_filename(self.filename),
+            file_signature = self._saved_signature
+            lines = snapshot if snapshot is not None else self.lines
+            endings = line_endings if line_endings is not None else self.line_endings
+            filename_sig = self._signature_filename(self.filename)
+            self._saved_signature = self._line_signature(lines, endings) + (
+                self.line_endings_trusted, filename_sig,
             )
+            # Until an edit materializes it, a mapped buffer keeps reporting
+            # the file form; remember which content form that stands for.
+            self._mapped_signature_aliases[self._saved_signature] = file_signature
+            self._remember_saved_content(
+                self._saved_signature, lines, endings, self.line_endings_trusted, filename_sig)
+
+    def _remember_saved_content(self, signature, lines, line_endings,
+                                trusted: bool, filename_sig) -> None:
+        """Keep the content a content-form saved signature was computed from,
+        so _content_matches_saved can answer without hashing the buffer.
+        Entries for signatures no buffer is saved at any more are dropped."""
+        if (isinstance(lines, MMapLineStore)
+                or not (isinstance(signature, tuple) and signature[:1] == ("lines",))):
+            return
+        live = {self._saved_signature, signature}
+        live.update(b.saved_signature for b in getattr(self, "buffers", []))
+        for key in [key for key in self._saved_contents if key not in live]:
+            del self._saved_contents[key]
+        self._saved_contents[signature] = (
+            list(lines), list(line_endings), trusted, filename_sig)
+
+    def _content_matches_saved(self, saved_signature, lines, line_endings,
+                               trusted: bool, filename) -> bool | None:
+        """Whether the content equals what `saved_signature` was computed
+        from, or None when that content is not on hand. Same answer as
+        comparing signatures: unchanged rows share their string objects, so
+        the list comparison mostly checks identity instead of hashing."""
+        if isinstance(lines, MMapLineStore) or not isinstance(saved_signature, tuple):
+            return None
+        saved = self._saved_contents.get(saved_signature)
+        if saved is None:
+            return None
+        saved_lines, saved_endings, saved_trusted, saved_filename = saved
+        if (trusted != saved_trusted
+                or self._signature_filename(filename) != saved_filename
+                or len(lines) != len(saved_lines)):
+            return False
+        # _line_signature only covers line endings when there is one per line.
+        with_endings = len(line_endings) == len(lines)
+        if with_endings != (len(saved_endings) == len(saved_lines)):
+            return False
+        if with_endings and line_endings != saved_endings:
+            return False
+        return lines == saved_lines
 
     def _refresh_modified(self):
+        same = self._content_matches_saved(
+            self._saved_signature, self.lines, self.line_endings,
+            self.line_endings_trusted, self.filename)
+        if same is not None:
+            self.modified = not same
+            return
         self.modified = self._current_signature() != self._saved_signature
+        if not self.modified:
+            self._remember_saved_content(
+                self._saved_signature, self.lines, self.line_endings,
+                self.line_endings_trusted, self._signature_filename(self.filename))
 
     def _normalize_line_endings(self):
         if len(self.line_endings) < len(self.lines):
@@ -3203,14 +3570,14 @@ set errorcolor=black          " error message text colour on the bottom line
             self.line_endings = [""] * len(self.lines)
 
     def _insert_line_endings(self, index: int, count: int,
-                             ending: Optional[str] = None):
+                             ending: str | None = None):
         if count <= 0:
             return
         self._insert_line_ending_values(
             index, [(self.default_line_ending if ending is None else ending)] * count
         )
 
-    def _insert_line_ending_values(self, index: int, endings: List[str]):
+    def _insert_line_ending_values(self, index: int, endings: list[str]):
         if not endings:
             return
         self._normalize_line_endings()
@@ -3225,7 +3592,7 @@ set errorcolor=black          " error message text colour on the bottom line
         if not self.line_endings and self.lines:
             self.line_endings = [""] * len(self.lines)
 
-    def _line_endings_for_range(self, start: int, stop: int) -> List[str]:
+    def _line_endings_for_range(self, start: int, stop: int) -> list[str]:
         if stop < start:
             return []
         return [
@@ -3244,15 +3611,15 @@ set errorcolor=black          " error message text colour on the bottom line
                 return ending
         return self.default_line_ending
 
-    def _linewise_put_endings(self, index: int, repeat: int = 1) -> List[str]:
+    def _linewise_put_endings(self, index: int, repeat: int = 1) -> list[str]:
         return self._linewise_put_endings_for(
             self.yank_buffer, self.yank_line_endings, index, repeat
         )
 
     def _linewise_put_endings_for(
-        self, buffer: List[str], line_endings: List[str],
+        self, buffer: list[str], line_endings: list[str],
         index: int, repeat: int = 1
-    ) -> List[str]:
+    ) -> list[str]:
         if len(line_endings) != len(buffer):
             return []
         endings = list(line_endings) * max(1, repeat)
@@ -3298,7 +3665,11 @@ set errorcolor=black          " error message text colour on the bottom line
         self._refresh_modified()
         self._sync_current_buffer()
         for b in self.buffers:
-            b.modified = self._buffer_signature(b) != b.saved_signature
+            same = self._content_matches_saved(
+                b.saved_signature, b.lines, b.line_endings,
+                b.line_endings_trusted, b.filename)
+            b.modified = (not same if same is not None
+                          else self._buffer_signature(b) != b.saved_signature)
 
     def _load_buffer_state(self, index: int):
         b = self.buffers[index]
@@ -3355,8 +3726,8 @@ set errorcolor=black          " error message text colour on the bottom line
         self._load_buffer_state(index)
         self.message = f"Buffer {index + 1}/{len(self.buffers)}: {self._current_file_label()}"
 
-    def _find_buffer_by_filename(self, filename: Optional[str],
-                                 exclude_index: Optional[int] = None) -> Optional[int]:
+    def _find_buffer_by_filename(self, filename: str | None,
+                                 exclude_index: int | None = None) -> int | None:
         full_filename = self._normalize_path(filename)
         if not full_filename:
             return None
@@ -3387,7 +3758,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._sync_current_buffer()
         return True
 
-    def _append_buffer(self, filename: Optional[str] = None, switch: bool = True,
+    def _append_buffer(self, filename: str | None = None, switch: bool = True,
                        refresh_existing: bool = False,
                        force_reload_existing: bool = False) -> bool:
         self._sync_current_buffer()
@@ -3502,7 +3873,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self.message_is_error = False
         self._force_redraw = True
 
-    def _buffer_list_lines(self) -> List[str]:
+    def _buffer_list_lines(self) -> list[str]:
         lines = []
         for i, b in enumerate(self.buffers):
             current = "%" if i == self.current_buffer else " "
@@ -3515,7 +3886,7 @@ set errorcolor=black          " error message text colour on the bottom line
     def _show_recent_files(self):
         self._sync_current_buffer()
         seen: set = set()
-        paths: List[str] = []
+        paths: list[str] = []
         for b in self.buffers:
             if b.filename:
                 abspath = os.path.abspath(b.filename)
@@ -3551,7 +3922,7 @@ set errorcolor=black          " error message text colour on the bottom line
         try:
             size = os.path.getsize(full_filename)
             if size > 0 and size >= self.LARGE_FILE_MMAP_THRESHOLD:
-                new_lines: Union[List[str], MMapLineStore] = MMapLineStore(full_filename)
+                new_lines: list[str] | MMapLineStore = MMapLineStore(full_filename)
                 new_line_endings = new_lines.line_endings()
                 lossy_decode = new_lines.has_lossy_decode()
             else:
@@ -3697,7 +4068,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self.message_is_error = False
         return True
 
-    def _write_copy_without_renaming(self, target: str, original_filename: Optional[str]) -> bool:
+    def _write_copy_without_renaming(self, target: str, original_filename: str | None) -> bool:
         if not self._save_file(target, rename_buffer=False):
             return False
         self.filename = original_filename
@@ -3740,7 +4111,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self._set_error(str(exc))
             return False
 
-    def _set_log_type(self, log_type: Optional[str]) -> bool:
+    def _set_log_type(self, log_type: str | None) -> bool:
         if log_type not in (None, "") and log_type not in self.LOG_TYPES:
             self._set_error(f"Unknown log type: {log_type}")
             return False
@@ -3759,13 +4130,13 @@ set errorcolor=black          " error message text colour on the bottom line
         self.message_is_error = False
         return True
 
-    def _buffer_text_for_save(self) -> Tuple[str, List[str]]:
+    def _buffer_text_for_save(self) -> tuple[str, list[str]]:
         return (
             self.default_line_ending.join(self.lines) + self.default_line_ending,
             [self.default_line_ending] * len(self.lines),
         )
 
-    def _backup_paths(self, target: str) -> Tuple[str, str, str, str, str]:
+    def _backup_paths(self, target: str) -> tuple[str, str, str, str, str]:
         target_dir = os.path.dirname(os.path.abspath(target)) or "."
         base = os.path.basename(target)
         stem, ext = os.path.splitext(base)
@@ -3775,7 +4146,7 @@ set errorcolor=black          " error message text colour on the bottom line
         generation_file = os.path.join(generation_dir, f"{stem}_{ext_name}.gen")
         return backup_dir, generation_dir, generation_file, stem, ext_name
 
-    def _read_generation_file(self, generation_file: str) -> Tuple[int, int]:
+    def _read_generation_file(self, generation_file: str) -> tuple[int, int]:
         last_generation = 0
         keep = 0
         try:
@@ -4049,7 +4420,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 pass
             os.close(fd)
 
-    def _save_file(self, filename: Optional[str] = None, rename_buffer: bool = True,
+    def _save_file(self, filename: str | None = None, rename_buffer: bool = True,
                    force: bool = False, skip_unchanged_check: bool = False,
                    skip_backup: bool = False) -> bool:
         if self.read_only:
@@ -4102,14 +4473,14 @@ set errorcolor=black          " error message text colour on the bottom line
                 target_dir = os.path.dirname(os.path.abspath(write_target)) or "."
                 if not os.path.isdir(target_dir):
                     raise FileNotFoundError(target_dir)
-                if isinstance(self.lines, MMapLineStore) and self.lines.is_mapped:
-                    # Detach only when this save changes or rewrites the current
-                    # file. Copy-writes should preserve the original mmap-backed
-                    # buffer and its external-change tracking.
-                    if same_target or rename_buffer:
-                        materialized = list(self.lines)
-                        self.lines = materialized
-                        self._ensure_content_baseline(materialized, list(self.line_endings))
+                # Detach only when this save changes or rewrites the current
+                # file. Copy-writes should preserve the original mmap-backed
+                # buffer and its external-change tracking.
+                if (isinstance(self.lines, MMapLineStore) and self.lines.is_mapped
+                        and (same_target or rename_buffer)):
+                    materialized = list(self.lines)
+                    self.lines = materialized
+                    self._ensure_content_baseline(materialized, list(self.line_endings))
                 text, saved_endings = self._buffer_text_for_save()
                 # Saving joins with the default line ending; warn when that
                 # actually converts endings the file was loaded with.
@@ -4159,7 +4530,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._refresh_all_buffer_modified_flags()
         original_index = self.current_buffer
         written = 0
-        failed: List[str] = []
+        failed: list[str] = []
         try:
             for i, b in enumerate(list(self.buffers)):
                 if not b.modified:
@@ -4384,14 +4755,14 @@ set errorcolor=black          " error message text colour on the bottom line
         line = self.lines[self.cursor_row]
         self.cursor_col = max(0, min(col, len(line)))
 
-    def _first_nonblank(self, row: Optional[int] = None) -> int:
+    def _first_nonblank(self, row: int | None = None) -> int:
         row = self.cursor_row if row is None else row
         for i, ch in enumerate(self.lines[row]):
             if not ch.isspace():
                 return i
         return 0
 
-    def _caret_line_start_col(self, row: Optional[int] = None, col: Optional[int] = None) -> int:
+    def _caret_line_start_col(self, row: int | None = None, col: int | None = None) -> int:
         row = self.cursor_row if row is None else row
         col = self.cursor_col if col is None else col
         first = self._first_nonblank(row)
@@ -4438,7 +4809,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 break   # stuck at buffer edge; a huge count must not spin
 
     def _word_forward_target(self, row: int, col: int, count: int,
-                             big: bool = False) -> Tuple[int, int]:
+                             big: bool = False) -> tuple[int, int]:
         """Return a word-forward target without normal-mode EOL clamping."""
         for _ in range(count):
             start = (row, col)
@@ -4567,8 +4938,14 @@ set errorcolor=black          " error message text colour on the bottom line
             self._search_regex_cache.move_to_end(key)
             return cached
         try:
-            compiled = re.compile(pattern, flags)
-        except re.error:
+            # A user's pattern like "[[" makes re warn on stderr, which would
+            # scribble over the curses screen.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                compiled = re.compile(pattern, flags)
+        except (re.error, RecursionError, OverflowError):
+            # Deeply nested groups overflow the compiler's recursion limit and
+            # a huge repetition count overflows; both are just bad patterns.
             return None
         if len(self._search_regex_cache) >= 512:
             for _ in range(256):
@@ -4602,7 +4979,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 if m:
                     self._move(r, m.start())
                     return
-            for r in range(0, row + 1):
+            for r in range(row + 1):
                 m = regex.search(self.lines[r])
                 if m and (r != row or m.start() <= col):
                     self._move(r, m.start())
@@ -4655,8 +5032,8 @@ set errorcolor=black          " error message text colour on the bottom line
         the remaining repetitions are resolved modulo the cycle length instead
         of running a regex pass per repetition for huge counts.
         """
-        visited: dict[Tuple[int, int], int] = {}
-        order: List[Tuple[int, int]] = []
+        visited: dict[tuple[int, int], int] = {}
+        order: list[tuple[int, int]] = []
         for i in range(count):
             self._search(pattern, forward, literal=literal)
             if self.message_is_error:
@@ -4677,7 +5054,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return
         self._search(r"\b" + re.escape(word) + r"\b", forward)
 
-    def _word_under_cursor(self) -> Optional[str]:
+    def _word_under_cursor(self) -> str | None:
         line = self.lines[self.cursor_row]
         col = self.cursor_col
         if col >= len(line) or not self._is_word_char(line[col]):
@@ -4773,7 +5150,7 @@ set errorcolor=black          " error message text colour on the bottom line
         parts = [self.lines[row]]
         length = len(parts[0])
         # source row -> (leading whitespace stripped, join point, tail start)
-        spans: dict[int, Tuple[int, int, int]] = {}
+        spans: dict[int, tuple[int, int, int]] = {}
         for r in range(row + 1, last + 1):
             next_line = self.lines[r]
             tail = next_line.lstrip()
@@ -4810,7 +5187,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._clamp_marks()
 
     def _delete_range(self, r1: int, c1: int, r2: int, c2: int,
-                      linewise: bool) -> List[str]:
+                      linewise: bool) -> list[str]:
         """Delete region and return the deleted text as a list of strings."""
         if (r1, c1) > (r2, c2):
             r1, c1, r2, c2 = r2, c2, r1, c1
@@ -4855,7 +5232,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self.line_endings = [""]
         return yanked
 
-    def _get_char_range(self, r1: int, c1: int, r2: int, c2: int) -> List[str]:
+    def _get_char_range(self, r1: int, c1: int, r2: int, c2: int) -> list[str]:
         if r1 == r2:
             return [self.lines[r1][c1:max(0, c2 + 1)]]
         result = [self.lines[r1][c1:]]
@@ -4968,7 +5345,7 @@ set errorcolor=black          " error message text colour on the bottom line
     # Visual selection helpers
     # -----------------------------------------------------------------------
 
-    def _visual_bounds(self) -> Tuple[int, int, int, int]:
+    def _visual_bounds(self) -> tuple[int, int, int, int]:
         sr, sc = self.visual_start
         er, ec = self.cursor_row, self.cursor_col
         if (sr, sc) <= (er, ec):
@@ -4993,7 +5370,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return False
         return c2 >= c1
 
-    _VISUAL_CASE_FNS: dict = {
+    _VISUAL_CASE_FNS: ClassVar[dict[int, Callable[[str], str]]] = {
         ord("~"): _swapcase, ord("u"): _lowercase, ord("U"): _uppercase,
     }
 
@@ -5010,8 +5387,9 @@ set errorcolor=black          " error message text colour on the bottom line
                     self._repeat_visual_toggle_case(0, span, linewise=True, fn=fn)
                 )
             elif r1 == r2:
+                count = max(0, c2 - c1 + 1)
                 self._set_last_change(
-                    lambda cnt=max(0, c2 - c1 + 1), fn=fn:
+                    lambda cnt=count, fn=fn:
                     self._toggle_case_range(cnt, fn)
                 )
             else:
@@ -5205,19 +5583,19 @@ set errorcolor=black          " error message text colour on the bottom line
         self._force_redraw = True
         return True
 
-    def _block_payload_cells(self, pieces: List[str], vcol: int = 0) -> int:
+    def _block_payload_cells(self, pieces: list[str], vcol: int = 0) -> int:
         """Size padded pieces at their destination without expanding tabs.
         Stop once the result is already too large for the allocation guard."""
         width = 0
         for piece in pieces:
-            if piece.isascii() and "\t" not in piece and "\x00" not in piece:
+            if piece.isascii() and piece.isprintable():
                 size = len(piece)
             else:
                 col = vcol
                 for ch in piece:
                     if ch == "\t":
                         col += self.tab_stop - col % self.tab_stop
-                    elif ch == "\x00":
+                    elif ch < " " or ch == "\x7f":
                         col += 2
                     else:
                         col += self._char_display_width(ch)
@@ -5229,7 +5607,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 return self.BLOCK_PAD_LIMIT + 1
         return width * len(pieces)
 
-    def _normalized_block_pieces(self, pieces: List[str], vcol: int) -> List[str]:
+    def _normalized_block_pieces(self, pieces: list[str], vcol: int) -> list[str]:
         """Expand accepted payload tabs at their destination before repeating.
         Register contents themselves retain their original text."""
         result = []
@@ -5247,7 +5625,7 @@ set errorcolor=black          " error message text colour on the bottom line
         """Display column where character `col` of `row` starts."""
         return self._display_width(self.lines[row][:col])
 
-    def _block_char_extent(self, row: int, col: int) -> Tuple[int, int]:
+    def _block_char_extent(self, row: int, col: int) -> tuple[int, int]:
         """(first, last) display columns covered by character `col` of `row`.
         A position at or past the line end (e.g. on an empty line) covers
         one column."""
@@ -5260,7 +5638,7 @@ set errorcolor=black          " error message text colour on the bottom line
     def _col_at_vcol(self, line: str, vcol: int) -> int:
         """Index of the first character of `line` starting at or after display
         column `vcol` (len(line) if the line is too short)."""
-        if line.isascii() and "\t" not in line and "\x00" not in line:
+        if line.isascii() and line.isprintable():
             return min(max(0, vcol), len(line))
         v = 0
         for i, (_, width) in enumerate(self._display_chunks(line, 0)):
@@ -5271,7 +5649,7 @@ set errorcolor=black          " error message text colour on the bottom line
 
     def _col_covering_vcol(self, line: str, vcol: int) -> int:
         """Index covering a display cell, or len(line) beyond the end."""
-        if line.isascii() and "\t" not in line and "\x00" not in line:
+        if line.isascii() and line.isprintable():
             return min(max(0, vcol), len(line))
         v = 0
         for i, (_, width) in enumerate(self._display_chunks(line, 0)):
@@ -5285,7 +5663,7 @@ set errorcolor=black          " error message text colour on the bottom line
         col = self._col_covering_vcol(self.lines[row], vcol)
         return self._display_col(row, col) + vcol - self._block_vcol(row, col)
 
-    def _visual_block_bounds(self) -> Tuple[int, int, int, int]:
+    def _visual_block_bounds(self) -> tuple[int, int, int, int]:
         """(r1, r2, vl, vr) of the current Ctrl-V selection."""
         ar, ac = self.visual_start
         ar = max(0, min(ar, len(self.lines) - 1))
@@ -5297,7 +5675,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return min(ar, self.cursor_row), max(ar, self.cursor_row), vl, vr
 
     def _block_from_cursor(self, height: int, width: int,
-                           to_eol: bool) -> Tuple[int, int, int, int]:
+                           to_eol: bool) -> tuple[int, int, int, int]:
         """A block of the given size anchored at the cursor (for `.`)."""
         r1 = self.cursor_row
         r2 = min(len(self.lines) - 1, r1 + max(1, height) - 1)
@@ -5305,17 +5683,17 @@ set errorcolor=black          " error message text colour on the bottom line
         vr = self._BLOCK_EOL if to_eol else vl + max(1, width) - 1
         return r1, r2, vl, vr
 
-    def _split_straddling_cells(self, line: str, vcols: Tuple[int, ...],
+    def _split_straddling_cells(self, line: str, vcols: tuple[int, ...],
                                 tabs_only: bool = False) -> str:
         """`line` with every tab (and, unless tabs_only, wide character) that
         straddles one of `vcols` -- starts before the column and still covers
         it -- replaced by spaces of the same width. Each column then falls on
         a character boundary, so cutting or inserting there leaves the cells
         on either side where they were on screen."""
-        if line.isascii() and "\t" not in line and "\x00" not in line:
+        if line.isascii() and line.isprintable():
             return line
         targets = [v for v in vcols if v > 0]
-        out: List[str] = []
+        out: list[str] = []
         changed = False
         v = 0
         for ch, (_, width) in zip(line, self._display_chunks(line, 0)):
@@ -5328,7 +5706,7 @@ set errorcolor=black          " error message text colour on the bottom line
             v += width
         return "".join(out) if changed else line
 
-    def _block_split_row(self, row: int, vcols: Tuple[int, ...],
+    def _block_split_row(self, row: int, vcols: tuple[int, ...],
                          tabs_only: bool = False) -> str:
         """Apply _split_straddling_cells to buffer row `row` (adjusting marks)
         and return the resulting line."""
@@ -5339,14 +5717,14 @@ set errorcolor=black          " error message text colour on the bottom line
             self.lines[row] = new
         return new
 
-    def _block_row_span(self, row: int, vl: int, vr: int) -> Tuple[int, int]:
+    def _block_row_span(self, row: int, vl: int, vr: int) -> tuple[int, int]:
         return self._line_block_span(self.lines[row], vl, vr)
 
-    def _line_block_span(self, line: str, vl: int, vr: int) -> Tuple[int, int]:
+    def _line_block_span(self, line: str, vl: int, vr: int) -> tuple[int, int]:
         """Half-open character range [c1, c2) of `line` whose display cells
         overlap columns vl..vr. Lines that don't reach vl give an empty range
         at the line end."""
-        if line.isascii() and "\t" not in line and "\x00" not in line:
+        if line.isascii() and line.isprintable():
             return min(vl, len(line)), min(vr + 1, len(line))
         c1 = c2 = -1
         v = 0
@@ -5372,7 +5750,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 return True
         return False
 
-    def _block_text(self, r1: int, r2: int, vl: int, vr: int) -> List[str]:
+    def _block_text(self, r1: int, r2: int, vl: int, vr: int) -> list[str]:
         pieces = []
         for row in range(r1, r2 + 1):
             line = self._split_straddling_cells(self.lines[row], (vl, vr + 1))
@@ -5380,7 +5758,7 @@ set errorcolor=black          " error message text colour on the bottom line
             pieces.append(line[c1:c2])
         return pieces
 
-    def _block_delete_rows(self, r1: int, r2: int, vl: int, vr: int) -> List[str]:
+    def _block_delete_rows(self, r1: int, r2: int, vl: int, vr: int) -> list[str]:
         """Cut the block out of every row; returns the removed pieces."""
         deleted = []
         for row in range(r1, r2 + 1):
@@ -5460,7 +5838,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return self.active_register in self.block_registers
         return self.yank_is_block
 
-    def _put_block_text(self, pieces: List[str], row: int, vcol: int,
+    def _put_block_text(self, pieces: list[str], row: int, vcol: int,
                         count: int = 1) -> int:
         """Insert `pieces` as a column at display column `vcol` of `row` and
         the rows below it, padding short rows with spaces and appending rows
@@ -5500,7 +5878,7 @@ set errorcolor=black          " error message text colour on the bottom line
         put_buffer, _, _ = self._resolve_put_source()
         self._put_block_payload(put_buffer, after, count)
 
-    def _put_block_payload(self, pieces: List[str], after: bool, count: int = 1):
+    def _put_block_payload(self, pieces: list[str], after: bool, count: int = 1):
         if not pieces or not any(pieces):
             self.message = "Nothing in register"
             self.message_is_error = True
@@ -5586,7 +5964,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self.modified = True
         self._force_redraw = True
 
-    def _repeat_block_replace(self, text: List[str], is_block: bool,
+    def _repeat_block_replace(self, text: list[str], is_block: bool,
                               r1: int, r2: int, vl: int, vr: int):
         """`.` after a block p/P: replace a same-sized block at the cursor.
         Single-line text fills however many rows the new block has (fewer
@@ -5637,12 +6015,11 @@ set errorcolor=black          " error message text colour on the bottom line
                 self._block_rest_cursor(r1, vl)
                 return
         self._enter_insert()
-        if kind == "c":
-            if self._block_will_change(r1, r2, vl, vr):
-                deleted = self._block_delete_rows(r1, r2, vl, vr)
-                self._store_register(deleted, False, blockwise=True)
-                self.modified = True
-                self._force_redraw = True
+        if kind == "c" and self._block_will_change(r1, r2, vl, vr):
+            deleted = self._block_delete_rows(r1, r2, vl, vr)
+            self._store_register(deleted, False, blockwise=True)
+            self.modified = True
+            self._force_redraw = True
         # Preserve the full deleted-register shape, but type and replicate
         # only from the first row that reaches the selected column.
         r1 = typing_row
@@ -5677,7 +6054,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self._block_begin_insert(kind, *self._block_from_cursor(h, w, eol))
         )
 
-    def _finish_block_insert(self) -> Optional[Tuple[int, int]]:
+    def _finish_block_insert(self) -> tuple[int, int] | None:
         """Restore unused preparation and replicate a plain first-row insert.
         Return a resting cursor only when still on the first row; edits
         elsewhere keep their cursor and are never replicated."""
@@ -5741,7 +6118,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return (r1, col)
 
     def _insert_linewise_change_target(self, row: int, deleted_count: int,
-                                       ending: Optional[str] = None, *,
+                                       ending: str | None = None, *,
                                        whole_buffer: bool = False):
         """Create the single replacement line used by linewise change."""
         if deleted_count <= 0:
@@ -5764,11 +6141,11 @@ set errorcolor=black          " error message text colour on the bottom line
     # -----------------------------------------------------------------------
 
     @staticmethod
-    def _markdown_split_table_row(line: str) -> Optional[List[str]]:
+    def _markdown_split_table_row(line: str) -> list[str] | None:
         if "|" not in line:
             return None
-        cells: List[str] = []
-        current: List[str] = []
+        cells: list[str] = []
+        current: list[str] = []
         saw_pipe = False
         in_code = False
         idx = 0
@@ -5802,10 +6179,10 @@ set errorcolor=black          " error message text colour on the bottom line
         return [cell.strip() for cell in cells]
 
     @staticmethod
-    def _markdown_split_table_row_spans(line: str) -> Optional[List[Tuple[str, int, int, int, int]]]:
+    def _markdown_split_table_row_spans(line: str) -> list[tuple[str, int, int, int, int]] | None:
         if "|" not in line:
             return None
-        segments: List[Tuple[int, int]] = []
+        segments: list[tuple[int, int]] = []
         saw_pipe = False
         in_code = False
         start = 0
@@ -5834,7 +6211,7 @@ set errorcolor=black          " error message text colour on the bottom line
         if len(segments) < 2:
             return None
 
-        cells: List[Tuple[str, int, int, int, int]] = []
+        cells: list[tuple[str, int, int, int, int]] = []
         for seg_start, seg_end in segments:
             content_start, content_end = seg_start, seg_end
             while content_start < content_end and line[content_start].isspace():
@@ -5845,8 +6222,8 @@ set errorcolor=black          " error message text colour on the bottom line
         return cells
 
     @staticmethod
-    def _markdown_table_alignments(cells: List[str]) -> Optional[List[str]]:
-        alignments: List[str] = []
+    def _markdown_table_alignments(cells: list[str]) -> list[str] | None:
+        alignments: list[str] = []
         for cell in cells:
             marker = cell.replace(" ", "")
             if not re.fullmatch(r":?-+:?", marker):
@@ -5872,14 +6249,15 @@ set errorcolor=black          " error message text colour on the bottom line
             return 0
         return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
-    def _display_chunks(self, text: str, start_col: int) -> Iterator[Tuple[str, int]]:
+    def _display_chunks(self, text: str, start_col: int) -> Iterator[tuple[str, int]]:
         col = start_col
         for ch in text:
             if ch == "\t":
                 width = self.tab_stop - (col % self.tab_stop)
                 rendered = " " * width
-            elif ch == "\x00":
-                rendered = "^@"
+            elif ch < " " or ch == "\x7f":
+                # Control characters show in caret notation, as curses does.
+                rendered = "^" + chr(ord(ch) ^ 64)
                 width = 2
             else:
                 rendered = ch
@@ -5892,14 +6270,14 @@ set errorcolor=black          " error message text colour on the bottom line
         text: str,
         start_col: int,
         skip_cols: int = 0,
-        max_width: Optional[int] = None,
+        max_width: int | None = None,
     ) -> str:
-        if text.isascii() and "\t" not in text and "\x00" not in text:
+        if text.isascii() and text.isprintable():
             start = max(0, skip_cols)
             if max_width is None:
                 return text[start:]
             return text[start:start + max(0, max_width)]
-        out: List[str] = []
+        out: list[str] = []
         remaining_skip = max(0, skip_cols)
         used = 0
         for rendered, width in self._display_chunks(text, start_col):
@@ -5942,14 +6320,15 @@ set errorcolor=black          " error message text colour on the bottom line
         return "".join(out)
 
     def _display_width_at_col(self, text: str, start_col: int) -> int:
-        # '\t' display width depends on start_col; '\x00' renders as 2-char "^@";
+        # '\t' display width depends on start_col; other control characters
+        # render as 2-char caret notation ("^@", "^[");
         # wide/combining Unicode requires unicodedata. Everything else is 1 per char.
-        if text.isascii() and '\t' not in text and '\x00' not in text:
+        if text.isascii() and text.isprintable():
             return len(text)
         return sum(width for _, width in self._display_chunks(text, start_col))
 
     def _display_partition_by_cols(self, text: str, start_col: int,
-                                   start: int, end: int) -> Tuple[str, str, str]:
+                                   start: int, end: int) -> tuple[str, str, str]:
         start = max(0, start)
         end = max(start, end)
         before = self._display_slice(text, start_col, max_width=start)
@@ -5964,7 +6343,7 @@ set errorcolor=black          " error message text colour on the bottom line
         visible = self._display_slice(text, start_col, max_width=width)
         return visible + (" " * max(0, width - self._display_width(visible)))
 
-    def _markdown_table_widths(self, rows: List[List[str]], separator_idx: int) -> List[int]:
+    def _markdown_table_widths(self, rows: list[list[str]], separator_idx: int) -> list[int]:
         column_count = max(len(row_cells) for row_cells in rows)
         widths = [3] * column_count
         pipe_col = 0
@@ -5982,7 +6361,7 @@ set errorcolor=black          " error message text colour on the bottom line
 
     def _markdown_align_cell_text(
         self, cell: str, width: int, alignment: str, content_col: int
-    ) -> Tuple[str, int, int]:
+    ) -> tuple[str, int, int]:
         if alignment == "right":
             best_left = 0
             best_rendered = self._display_text_at_col(cell, content_col)
@@ -5999,7 +6378,7 @@ set errorcolor=black          " error message text colour on the bottom line
         if alignment == "center":
             best_left = 0
             best_rendered = self._display_text_at_col(cell, content_col)
-            best_score: Optional[Tuple[int, int]] = None
+            best_score: tuple[int, int] | None = None
             for left_pad in range(width + 1):
                 rendered = self._display_text_at_col(cell, content_col + left_pad)
                 rendered_width = self._display_width(rendered)
@@ -6022,7 +6401,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return rendered + (" " * right_pad), 0, rendered_width
 
     def _markdown_format_table_row(
-        self, cells: List[str], widths: List[int], alignments: List[str], separator: bool
+        self, cells: list[str], widths: list[int], alignments: list[str], separator: bool
     ) -> str:
         pieces = []
         pipe_col = 0
@@ -6047,7 +6426,7 @@ set errorcolor=black          " error message text colour on the bottom line
             pipe_col += width + 3
         return "|" + "|".join(pieces) + "|"
 
-    def _markdown_table_block(self, row: int) -> Optional[Tuple[int, int, int]]:
+    def _markdown_table_block(self, row: int) -> tuple[int, int, int] | None:
         if self._syntax_language() != "markdown" or not (0 <= row < len(self.lines)):
             return None
         if self._markdown_split_table_row(self.lines[row]) is None:
@@ -6073,7 +6452,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return None
         return table_start, separator_row, end
 
-    def _markdown_table_layout(self, row: int) -> Optional[Tuple[List[str], List[int], List[str], bool]]:
+    def _markdown_table_layout(self, row: int) -> tuple[list[str], list[int], list[str], bool] | None:
         token = (id(self.lines), self._content_revision,
                  self._syntax_language(), self.tab_stop)
         hot = self._md_hot_block
@@ -6148,7 +6527,7 @@ set errorcolor=black          " error message text colour on the bottom line
         is_separator = row == separator_row
         return current_cells, widths, alignments, is_separator
 
-    def _markdown_table_display_line(self, row: int) -> Optional[str]:
+    def _markdown_table_display_line(self, row: int) -> str | None:
         layout = self._markdown_table_layout(row)
         if layout is None:
             return None
@@ -6169,7 +6548,7 @@ set errorcolor=black          " error message text colour on the bottom line
     def _display_width(self, text: str) -> int:
         return self._display_width_at_col(text, 0)
 
-    def _markdown_table_display_col(self, row: int, col: int) -> Optional[int]:
+    def _markdown_table_display_col(self, row: int, col: int) -> int | None:
         layout = self._markdown_table_layout(row)
         spans = self._markdown_split_table_row_spans(self.lines[row])
         if layout is None or spans is None:
@@ -6183,12 +6562,7 @@ set errorcolor=black          " error message text colour on the bottom line
             if is_separator:
                 cell_start = pipe_col + 2
                 rendered_width = len(formatted_cell)
-            elif alignment == "right":
-                _, left_pad, rendered_width = self._markdown_align_cell_text(
-                    formatted_cell, width, alignment, pipe_col + 2
-                )
-                cell_start = pipe_col + 2 + left_pad
-            elif alignment == "center":
+            elif alignment == "right" or alignment == "center":
                 _, left_pad, rendered_width = self._markdown_align_cell_text(
                     formatted_cell, width, alignment, pipe_col + 2
                 )
@@ -6229,7 +6603,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return log_col
         return self._display_width(self.lines[row][:col])
 
-    def _display_syntax_language(self) -> Optional[str]:
+    def _display_syntax_language(self) -> str | None:
         if self.log_type:
             return f"log:{self.log_type}"
         if self.log_type is None and self.filename:
@@ -6238,7 +6612,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 return "log:generic"
         return self._syntax_language()
 
-    def _syntax_language(self) -> Optional[str]:
+    def _syntax_language(self) -> str | None:
         if not self.filename:
             return None
         _, ext = os.path.splitext(self.filename.lower())
@@ -6248,7 +6622,7 @@ set errorcolor=black          " error message text colour on the bottom line
         fields = []
 
         def add_field(match: re.Match[str], name: str, rendered: str,
-                      display_start: int) -> Tuple[int, int]:
+                      display_start: int) -> tuple[int, int]:
             raw_start, raw_end = match.span(name)
             display_end = display_start + self._display_width_at_col(rendered, display_start)
             fields.append((raw_start, raw_end, display_start, display_end, rendered))
@@ -6425,7 +6799,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return f"{best}:{port}"
         return best
 
-    def _log_display_col(self, row: int, col: int) -> Optional[int]:
+    def _log_display_col(self, row: int, col: int) -> int | None:
         if not self.log_type or not (0 <= row < len(self.lines)):
             return None
         layout = self._build_log_layout(self.lines[row], self.log_type)
@@ -6451,7 +6825,7 @@ set errorcolor=black          " error message text colour on the bottom line
             prev_display_end + max(0, col - prev_raw_end),
         )
 
-    def _log_field_spans(self, text: str) -> List[Tuple[int, int]]:
+    def _log_field_spans(self, text: str) -> list[tuple[int, int]]:
         spans = []
         start = 0
         while True:
@@ -6473,8 +6847,8 @@ set errorcolor=black          " error message text colour on the bottom line
             return "comment"
         return "keyword"
 
-    def _message_extra_spans(self, text: str, start: int) -> List[Tuple[int, int, str]]:
-        spans: List[Tuple[int, int, str]] = []
+    def _message_extra_spans(self, text: str, start: int) -> list[tuple[int, int, str]]:
+        spans: list[tuple[int, int, str]] = []
         for match in self._RE_LOG_IP.finditer(text):
             spans.append((start + match.start(), start + match.end(), "string"))
         for match in self._RE_LOG_DIGITS.finditer(text):
@@ -6487,12 +6861,12 @@ set errorcolor=black          " error message text colour on the bottom line
             ))
         return spans
 
-    def _generic_log_syntax_spans(self, text: str) -> List[Tuple[int, int, str]]:
+    def _generic_log_syntax_spans(self, text: str) -> list[tuple[int, int, str]]:
         if not text:
             return []
         if text.startswith("Traceback"):
             return [(0, len(text), "preproc")]
-        spans: List[Tuple[int, int, str]] = []
+        spans: list[tuple[int, int, str]] = []
         ts_match = self._RE_LOG_GENERIC_TS.match(text)
         scan_start = 0
         if ts_match:
@@ -6504,13 +6878,13 @@ set errorcolor=black          " error message text colour on the bottom line
         spans.sort(key=lambda s: (s[0], s[1]))
         return spans
 
-    def _log_syntax_spans(self, text: str, log_type: str) -> List[Tuple[int, int, str]]:
+    def _log_syntax_spans(self, text: str, log_type: str) -> list[tuple[int, int, str]]:
         if not text:
             return []
         if log_type == "generic":
             return self._generic_log_syntax_spans(text)
         fields = self._log_field_spans(text)
-        spans: List[Tuple[int, int, str]] = []
+        spans: list[tuple[int, int, str]] = []
         effective_type = log_type
         if log_type == "flask" and len(fields) >= 7:
             maybe_level = text[fields[1][0]:fields[1][1]].strip()
@@ -6586,7 +6960,7 @@ set errorcolor=black          " error message text colour on the bottom line
         spans.sort(key=lambda s: (s[0], s[1]))
         return spans
 
-    def _syntax_comment_markers(self, lang: str) -> Tuple[str, ...]:
+    def _syntax_comment_markers(self, lang: str) -> tuple[str, ...]:
         if lang in ("python", "tcl"):
             return ("#",)
         if lang == "sql":
@@ -6599,8 +6973,8 @@ set errorcolor=black          " error message text colour on the bottom line
             return ()
         return ("//",)
 
-    def _markdown_syntax_spans(self, text: str) -> List[Tuple[int, int, str]]:
-        spans: List[Tuple[int, int, str]] = []
+    def _markdown_syntax_spans(self, text: str) -> list[tuple[int, int, str]]:
+        spans: list[tuple[int, int, str]] = []
         occupied = bytearray(len(text))
 
         def add_span(start: int, end: int, kind: str) -> bool:
@@ -6618,7 +6992,7 @@ set errorcolor=black          " error message text colour on the bottom line
         if self._RE_MD_FENCE.match(text):
             add_span(0, len(text), "string")
             return spans
-        if len(text) >= 4 and (text.startswith("    ") or text.startswith("\t")):
+        if len(text) >= 4 and text.startswith(("    ", "\t")):
             add_span(0, len(text), "string")
             return spans
         if self._RE_MD_BLOCKQUOTE.match(text):
@@ -6663,7 +7037,7 @@ set errorcolor=black          " error message text colour on the bottom line
         key, _ = self._syntax_cache.popitem(last=False)
         self._syntax_cache_bytes -= self._syntax_cache_weights.pop(key, 0)
 
-    def _syntax_spans(self, text: str, lang: Optional[str] = None) -> List[Tuple[int, int, str]]:
+    def _syntax_spans(self, text: str, lang: str | None = None) -> list[tuple[int, int, str]]:
         lang = lang or self._display_syntax_language()
         if not lang:
             return []
@@ -6699,7 +7073,7 @@ set errorcolor=black          " error message text colour on the bottom line
 
     def _syntax_protected_regions(
         self, text: str, lang: str, in_block_comment: bool = False
-    ) -> Tuple[List[Tuple[int, int, str]], List[Tuple[int, int]], bool, str]:
+    ) -> tuple[list[tuple[int, int, str]], list[tuple[int, int]], bool, str]:
         """Split a line into protected spans and code ranges, preserving offsets."""
         markers = self._syntax_comment_markers(lang)
         is_sql = lang == "sql"
@@ -6715,8 +7089,8 @@ set errorcolor=black          " error message text colour on the bottom line
         if not needs_scan:
             return [], ([(0, len(text))] if text else []), False, text
 
-        protected: List[Tuple[int, int, str]] = []
-        code_ranges: List[Tuple[int, int]] = []
+        protected: list[tuple[int, int, str]] = []
+        code_ranges: list[tuple[int, int]] = []
         structure = list(text)
         n = len(text)
         i = 0
@@ -6785,7 +7159,7 @@ set errorcolor=black          " error message text colour on the bottom line
         protected, code_ranges, out_block_comment, structure = self._syntax_protected_regions(
             text, lang, in_block_comment
         )
-        spans: List[Tuple[int, int, str]] = list(protected)
+        spans: list[tuple[int, int, str]] = list(protected)
         occupied = bytearray(len(text))
         for start, end, _ in protected:
             occupied[start:end] = b'\x01' * (end - start)
@@ -6835,7 +7209,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 for match in self._RE_SYNTAX_OPERATOR.finditer(text, range_start, range_end):
                     add_span(match.start(), match.end(), "operator")
 
-        brackets: Tuple[Tuple[int, str], ...]
+        brackets: tuple[tuple[int, str], ...]
         if lang in self.CLIKE_LANGUAGES and len(text) <= self.MAX_SYNTAX_LINE_CHARS:
             brackets = tuple(
                 (index, text[index])
@@ -6852,7 +7226,7 @@ set errorcolor=black          " error message text colour on the bottom line
             brackets,
         )
 
-    def _syntax_spans_core(self, text: str, lang: str) -> List[Tuple[int, int, str]]:
+    def _syntax_spans_core(self, text: str, lang: str) -> list[tuple[int, int, str]]:
         return list(self._analyze_syntax_line(text, lang).spans)
 
     def _syntax_attr(self, kind: str) -> int:
@@ -6872,7 +7246,7 @@ set errorcolor=black          " error message text colour on the bottom line
             is_sql = lang == "sql"
         else:
             markers, marker_firsts, is_sql = _ctx
-        out: List[str] = []
+        out: list[str] = []
         i = 0
         n = len(line)
         quote = ""
@@ -6911,8 +7285,8 @@ set errorcolor=black          " error message text colour on the bottom line
         stripped = self._strip_line_for_structure(line, lang)
         return stripped.count("{") - stripped.count("}")
 
-    def _python_breadcrumbs(self, row: int) -> List[str]:
-        stack: List[Tuple[int, int, str]] = []
+    def _python_breadcrumbs(self, row: int) -> list[str]:
+        stack: list[tuple[int, int, str]] = []
         end = min(row, len(self.lines) - 1)
         for lineno in range(end + 1):
             line = self.lines[lineno]
@@ -6934,8 +7308,8 @@ set errorcolor=black          " error message text colour on the bottom line
                 stack.append((indent, lineno, label))
         return [label for _, _, label in stack]
 
-    def _tcl_breadcrumbs(self, row: int) -> List[str]:
-        stack: List[Tuple[int, int, str]] = []
+    def _tcl_breadcrumbs(self, row: int) -> list[str]:
+        stack: list[tuple[int, int, str]] = []
         depth = 0
         end = min(row, len(self.lines) - 1)
         _scope_kw = ("proc ", "namespace ", "oo::class ", "method ", "constructor", "destructor")
@@ -6968,8 +7342,8 @@ set errorcolor=black          " error message text colour on the bottom line
             depth += stripped.count("{") - stripped.count("}")
         return [label for _, _, label in stack]
 
-    def _lisp_breadcrumbs(self, row: int) -> List[str]:
-        stack: List[Tuple[int, int, str]] = []
+    def _lisp_breadcrumbs(self, row: int) -> list[str]:
+        stack: list[tuple[int, int, str]] = []
         depth = 0
         end = min(row, len(self.lines) - 1)
         _lisp_markers = self._syntax_comment_markers("lisp")
@@ -6988,7 +7362,7 @@ set errorcolor=black          " error message text colour on the bottom line
             depth += stripped.count("(") - stripped.count(")")
         return [label for _, _, label in stack]
 
-    def _forth_breadcrumbs(self, row: int) -> List[str]:
+    def _forth_breadcrumbs(self, row: int) -> list[str]:
         end = min(row, len(self.lines) - 1)
         _forth_markers = self._syntax_comment_markers("forth")
         _forth_ctx = (_forth_markers, frozenset(m[0] for m in _forth_markers), False)
@@ -7007,7 +7381,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 closed_at = lineno
         return [label] if label else []
 
-    def _sql_breadcrumbs(self, row: int) -> List[str]:
+    def _sql_breadcrumbs(self, row: int) -> list[str]:
         end = min(row, len(self.lines) - 1)
         statement = ""
         _sql_markers = self._syntax_comment_markers("sql")
@@ -7150,8 +7524,8 @@ set errorcolor=black          " error message text colour on the bottom line
         return state
 
     def _ensure_clike_row(
-        self, row: int, lang: str, text: Optional[str] = None
-    ) -> Tuple[CLikeLineAnalysis, CLikeParseState]:
+        self, row: int, lang: str, text: str | None = None
+    ) -> tuple[CLikeLineAnalysis, CLikeParseState]:
         row = max(0, min(row, len(self.lines) - 1))
         before = CLikeParseState() if row == 0 else self._ensure_clike_state(row - 1, lang)
         analysis = self._cached_clike_analysis(
@@ -7170,11 +7544,11 @@ set errorcolor=black          " error message text colour on the bottom line
             self._clike_row_cache.move_to_end(row_key)
         return analysis, state
 
-    def _clike_breadcrumbs(self, row: int, lang: str) -> List[str]:
+    def _clike_breadcrumbs(self, row: int, lang: str) -> list[str]:
         state = self._ensure_clike_state(row, lang)
         return [label for _, _, label in state.stack]
 
-    def _current_breadcrumbs(self) -> List[str]:
+    def _current_breadcrumbs(self) -> list[str]:
         if self.log_type:
             return []
         lang = self._syntax_language()
@@ -7320,7 +7694,7 @@ set errorcolor=black          " error message text colour on the bottom line
         )
 
     def _draw_completion_matches(
-            self, stdscr, row: int, width: int, matches: List[str],
+            self, stdscr, row: int, width: int, matches: list[str],
             selected_index: int):
         usable = max(0, width - 1)
         if usable <= 0:
@@ -7371,9 +7745,8 @@ set errorcolor=black          " error message text colour on the bottom line
         def _overlay_selected_hidden_markers(col: int, visible_width: int, right_hidden: bool):
             if visible_width <= 0:
                 return
-            if right_hidden:
-                if col + visible_width < usable:
-                    _draw_hidden_indicator(col + visible_width)
+            if right_hidden and col + visible_width < usable:
+                _draw_hidden_indicator(col + visible_width)
 
         col = 0
         left_hidden = start_idx > 0 or force_left_indicator
@@ -7426,7 +7799,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self._intellisense_completion_index,
         )
 
-    def _prompt_view(self, text: str, cursor: int, width: int) -> Tuple[str, int]:
+    def _prompt_view(self, text: str, cursor: int, width: int) -> tuple[str, int]:
         usable = max(0, width - 1)
         if usable <= 0:
             return "", 0
@@ -7465,7 +7838,7 @@ set errorcolor=black          " error message text colour on the bottom line
     def _curses_safe_text(text: str) -> str:
         return text.replace("\x00", "^@")
 
-    def _add_curses_text(self, stdscr, row: int, col: int, text: str, attr: Optional[int] = None) -> int:
+    def _add_curses_text(self, stdscr, row: int, col: int, text: str, attr: int | None = None) -> int:
         display_width = self._display_width_at_col(text, col)
         text = self._display_text_at_col(text, col)
         height, width = self._last_h, self._last_w
@@ -7505,7 +7878,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return display_width
 
     def _add_syntax_text(self, stdscr, row: int, col: int, text: str, lnum: int,
-                         span_text: Optional[str] = None, span_offset: int = 0):
+                         span_text: str | None = None, span_offset: int = 0):
         source = text if span_text is None else span_text
         line_index = lnum
         if (
@@ -7536,7 +7909,7 @@ set errorcolor=black          " error message text colour on the bottom line
         # Build cumulative display-column array for source once (O(N)),
         # so each span lookup is O(1) instead of reprocessing a growing prefix.
         n = len(source)
-        if source.isascii() and '\t' not in source and '\x00' not in source:
+        if source.isascii() and source.isprintable():
             src_cols = None  # display column == char index for pure ASCII
             raw_view_start = min(n, view_start)
             raw_view_end = min(n, view_end)
@@ -7547,7 +7920,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 src_cols[i] = c
                 if ch == "\t":
                     c += self.tab_stop - (c % self.tab_stop)
-                elif ch == "\x00":
+                elif ch < " " or ch == "\x7f":
                     c += 2
                 else:
                     c += self._char_display_width(ch)
@@ -7582,7 +7955,7 @@ set errorcolor=black          " error message text colour on the bottom line
         if pos < visible_width:
             self._add_curses_text(stdscr, row, x, self._display_slice(text, 0, skip_cols=pos))
 
-    def _visible_line_parts(self, lnum: int, text_w: int) -> Tuple[str, str]:
+    def _visible_line_parts(self, lnum: int, text_w: int) -> tuple[str, str]:
         line = self._display_line_text(lnum)
         visible = self._display_slice(line, 0, skip_cols=self.left_col, max_width=text_w)
         content_visible = visible + (" " * max(0, text_w - self._display_width(visible)))
@@ -7594,7 +7967,7 @@ set errorcolor=black          " error message text colour on the bottom line
     def _wrap_text_width(self) -> int:
         return max(1, self._last_w - self._line_number_width())
 
-    def _wrapped_line_layout(self, row: int, text_w: int) -> Sequence[Tuple[int, str]]:
+    def _wrapped_line_layout(self, row: int, text_w: int) -> Sequence[tuple[int, str]]:
         """Display-column offsets and text for soft-wrapped rows; never edit the buffer."""
         text_w = max(1, text_w)
         source = self._display_line_text(row)
@@ -7612,7 +7985,7 @@ set errorcolor=black          " error message text colour on the bottom line
         text = self._display_text_at_col(source, 0)
         ascii_text = text.isascii()
         widths = None if ascii_text else [self._char_display_width(ch) for ch in text]
-        layout: List[Tuple[int, str]] = []
+        layout: list[tuple[int, str]] = []
         start = offset = 0
         last_width = 0
         while start < len(text):
@@ -7659,15 +8032,15 @@ set errorcolor=black          " error message text colour on the bottom line
                 return _VirtualWrappedLayout(layout, text_w, dcol, last_width)
         return layout
 
-    def _wrapped_cursor_position(self, text_w: int) -> Tuple[int, int]:
+    def _wrapped_cursor_position(self, text_w: int) -> tuple[int, int]:
         layout = self._wrapped_line_layout(self.cursor_row, text_w)
         dcol = self._cursor_display_col()
         segment = max(0, bisect_right(layout, dcol, key=lambda part: part[0]) - 1)
         return self.cursor_row, segment
 
     def _advance_wrapped_position(
-        self, position: Tuple[int, int], amount: int, text_w: int
-    ) -> Tuple[int, int]:
+        self, position: tuple[int, int], amount: int, text_w: int
+    ) -> tuple[int, int]:
         row, segment = position
         row = max(0, min(row, len(self.lines) - 1))
         segment = max(0, min(segment, len(self._wrapped_line_layout(row, text_w)) - 1))
@@ -7689,7 +8062,7 @@ set errorcolor=black          " error message text colour on the bottom line
             segment = len(self._wrapped_line_layout(row, text_w)) - 1
         return row, segment
 
-    def _wrapped_view_top(self, text_w: int) -> Tuple[int, int]:
+    def _wrapped_view_top(self, text_w: int) -> tuple[int, int]:
         if self._wrap_top_line != self.top_line:
             self._top_wrap = 0
         self.top_line, self._top_wrap = self._advance_wrapped_position(
@@ -7698,12 +8071,12 @@ set errorcolor=black          " error message text colour on the bottom line
         self._wrap_top_line = self.top_line
         return self.top_line, self._top_wrap
 
-    def _set_wrapped_view_top(self, position: Tuple[int, int]):
+    def _set_wrapped_view_top(self, position: tuple[int, int]):
         self.top_line, self._top_wrap = position
         self._wrap_top_line = self.top_line
 
     def _move_to_wrapped_position(
-        self, position: Tuple[int, int], screen_col: int = 0, direction: int = 1
+        self, position: tuple[int, int], screen_col: int = 0, direction: int = 1
     ):
         row, segment = position
         text_w = self._wrap_text_width()
@@ -7847,7 +8220,7 @@ set errorcolor=black          " error message text colour on the bottom line
         lnum_w = self._line_number_width()
         return f"{lnum + 1:{lnum_w - 1}d} "
 
-    def _find_matching_bracket(self, row: int, col: int) -> Optional[Tuple[int, int]]:
+    def _find_matching_bracket(self, row: int, col: int) -> tuple[int, int] | None:
         if not (0 <= row < len(self.lines)):
             return None
         line = self.lines[row]
@@ -7882,7 +8255,7 @@ set errorcolor=black          " error message text colour on the bottom line
 
     def _find_matching_clike_bracket(
         self, row: int, col: int, ch: str, target: str, lang: str
-    ) -> Optional[Tuple[int, int]]:
+    ) -> tuple[int, int] | None:
         """Match only code brackets, with a hard work budget for malformed files."""
         forward = ch in self.OPEN_BRACKETS
         depth = 0
@@ -7908,7 +8281,7 @@ set errorcolor=black          " error message text colour on the bottom line
                         return lineno, bracket_col
         return None
 
-    def _matching_bracket_pair(self) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    def _matching_bracket_pair(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
         # lang is part of the key -- :file/:f can change the effective
         # syntax language (and thus which bracket-matching algorithm
         # applies) without reassigning self.lines, so content_revision
@@ -7940,9 +8313,9 @@ set errorcolor=black          " error message text colour on the bottom line
         lnum: int,
         lnum_w: int,
         text_w: int,
-        bracket_positions: set[Tuple[int, int]],
-        cursor_pos: Optional[Tuple[int, int]] = None,
-        span_offset: Optional[int] = None,
+        bracket_positions: set[tuple[int, int]],
+        cursor_pos: tuple[int, int] | None = None,
+        span_offset: int | None = None,
     ):
         if not bracket_positions:
             return
@@ -8147,7 +8520,7 @@ set errorcolor=black          " error message text colour on the bottom line
                                    else self._block_display_col(lnum, b_vr + 1))
                             hl_e = min(visible_width, max(hl_s, end - span_offset))
                         else:
-                            def _dc(r, c):
+                            def _dc(r, c, span_offset=span_offset):
                                 return self._display_col(r, c) - span_offset
                             hl_s = _dc(lnum, v_c1) if lnum == v_r1 else 0
                             hl_e = _dc(lnum, v_c2 + 1) if lnum == v_r2 else self._display_width(visible)
@@ -8251,8 +8624,8 @@ set errorcolor=black          " error message text colour on the bottom line
             pass
 
         # Pre-compute command cursor position so both drawing and cursor sections share it
-        _visible_cmd: Optional[str] = None
-        _cmd_cursor_col: Optional[int] = None
+        _visible_cmd: str | None = None
+        _cmd_cursor_col: int | None = None
         if self._cmd_buf:
             try:
                 _visible_cmd, _cmd_cursor_col = self._prompt_view(
@@ -8294,8 +8667,8 @@ set errorcolor=black          " error message text colour on the bottom line
                     dcol = self._cursor_display_col() - offset
                     break
         scol   = dcol + lnum_w
-        phys_row: Optional[int] = None
-        phys_col: Optional[int] = None
+        phys_row: int | None = None
+        phys_col: int | None = None
         try:
             if self._cmd_buf and _cmd_cursor_col is not None:
                 phys_row, phys_col = height - 1, _cmd_cursor_col
@@ -8321,8 +8694,8 @@ set errorcolor=black          " error message text colour on the bottom line
                             status_left: str, status_right: str,
                             total: int, top_line: int,
                             draw_row: Callable, filler: bool = False,
-                            bottom: Optional[Callable] = None,
-                            cursor: Tuple[int, int] = (0, 0)):
+                            bottom: Callable | None = None,
+                            cursor: tuple[int, int] = (0, 0)):
         """Shared scaffold for full-screen overlay draws: text rows, status
         bar, bottom bar, refresh, and cursor placement. `draw_row(scr, srow,
         idx)` renders one visible row; `bottom(bottom_win)` draws the bottom
@@ -8420,7 +8793,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self.message_is_error = False
         self._force_redraw = True
 
-    def _help_section_lines(self) -> List[int]:
+    def _help_section_lines(self) -> list[int]:
         return [
             idx for idx, line in enumerate(self.HELP_LINES)
             if (idx != 0 and line and not line.startswith("  ") and
@@ -8471,7 +8844,7 @@ set errorcolor=black          " error message text colour on the bottom line
 
         self._set_error(f"Help pattern not found: {pattern}")
 
-    def _open_shell_output(self, command: str, lines: List[str], remember_shell: bool = True):
+    def _open_shell_output(self, command: str, lines: list[str], remember_shell: bool = True):
         self.mode = Mode.SHELL
         self.shell_command_label = command
         if remember_shell:
@@ -8501,7 +8874,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 win, width, "q/ESC close, j/k scroll, Ctrl-D/U and gg/G jump"),
         )
 
-    def _handle_scroll_overlay(self, key: int, top_line_attr: str, total_lines: int, close_keys: Tuple[int, ...]) -> bool:
+    def _handle_scroll_overlay(self, key: int, top_line_attr: str, total_lines: int, close_keys: tuple[int, ...]) -> bool:
         text_rows = max(1, self._last_h - 2)
         max_top = max(0, total_lines - text_rows)
         top_line = getattr(self, top_line_attr)
@@ -8639,7 +9012,7 @@ set errorcolor=black          " error message text colour on the bottom line
             key, "help_top_line", len(self.HELP_LINES), (27, curses.KEY_F1, ord("q"))
         )
 
-    def _hex_disk_image_path(self) -> Optional[str]:
+    def _hex_disk_image_path(self) -> str | None:
         """The buffer's file when the bytes on disk are exactly what the
         buffer holds: unmodified since it was loaded or saved, and the file
         unchanged since then. Hex view then shows those bytes rather than
@@ -8706,7 +9079,7 @@ set errorcolor=black          " error message text colour on the bottom line
         ascii_part = "".join(chr(byte) if 32 <= byte <= 126 else "." for byte in chunk)
         return f"{offset:08x}  {hex_part}  |{ascii_part:<16}|"
 
-    def _hex_view_lines(self, data: Optional[bytes] = None) -> List[str]:
+    def _hex_view_lines(self, data: bytes | None = None) -> list[str]:
         if data is None:
             data = self._buffer_hex_bytes()
         if not data:
@@ -8869,7 +9242,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return "[NL]"
         return "[NONE]"
 
-    def _line_endings_view_line(self, idx: int, width: Optional[int] = None) -> str:
+    def _line_endings_view_line(self, idx: int, width: int | None = None) -> str:
         """`idx`'s text followed by its ending marker. With `width`, text
         too wide for the screen is cut (marked with "…") so the marker --
         the point of this view -- always stays visible."""
@@ -8913,7 +9286,7 @@ set errorcolor=black          " error message text colour on the bottom line
             )
         )
 
-    def _line_endings_view_lines(self) -> List[str]:
+    def _line_endings_view_lines(self) -> list[str]:
         return [
             self._line_endings_view_line(idx) for idx in range(len(self.lines))
         ] or ["[NONE]"]
@@ -8979,7 +9352,7 @@ set errorcolor=black          " error message text colour on the bottom line
             key, "shell_top_line", len(self.shell_lines), (27, ord("q"))
         )
 
-    def _start_cmd_buf(self, prefix: str, context: Optional[Tuple[str, object]] = None):
+    def _start_cmd_buf(self, prefix: str, context: tuple[str, object] | None = None):
         self._cmd_buf = prefix
         self._cmd_cursor = len(prefix)
         self._cmd_context = context
@@ -8995,7 +9368,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._cmd_history_draft = ""
         self._clear_filename_completion()
 
-    def _cmd_history_key(self) -> Optional[str]:
+    def _cmd_history_key(self) -> str | None:
         if self._cmd_buf and self._cmd_buf[0] in self._cmd_history:
             return self._cmd_buf[0]
         return None
@@ -9029,8 +9402,7 @@ set errorcolor=black          " error message text colour on the bottom line
             index = self._cmd_history_index
 
         index += delta
-        if index < 0:
-            index = 0
+        index = max(index, 0)
         if index >= len(history):
             self._cmd_history_index = None
             self._cmd_buf = self._cmd_history_draft or key
@@ -9096,7 +9468,7 @@ set errorcolor=black          " error message text colour on the bottom line
         instead of the : command line."""
         try:
             self._execute_cmd(cmd)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - report any command bug, keep the session
             self._set_error(f"Command failed: {exc}")
 
     def _delete_buffer_from_list(self, index: int):
@@ -9233,13 +9605,13 @@ set errorcolor=black          " error message text colour on the bottom line
                 panel.top_line = 0
             self._clamp_fb_panel(panel)
 
-    def _fb_panels(self) -> Tuple[FileBrowserPanel, FileBrowserPanel]:
+    def _fb_panels(self) -> tuple[FileBrowserPanel, FileBrowserPanel]:
         return self.file_browser.left, self.file_browser.right
 
     def _active_fb_panel(self) -> FileBrowserPanel:
         return self._fb_panels()[self.file_browser.active_panel]
 
-    def _fb_entries_cache_key(self, panel: FileBrowserPanel) -> Tuple[object, ...]:
+    def _fb_entries_cache_key(self, panel: FileBrowserPanel) -> tuple[object, ...]:
         try:
             st = os.stat(panel.cwd)
             dir_sig = (st.st_ino, st.st_size, st.st_mtime_ns)
@@ -9258,7 +9630,7 @@ set errorcolor=black          " error message text colour on the bottom line
         panel.entries_cache_key = None
         panel.entries_cache = []
 
-    def _fb_entries(self, panel: FileBrowserPanel) -> List[FileBrowserEntry]:
+    def _fb_entries(self, panel: FileBrowserPanel) -> list[FileBrowserEntry]:
         cache_key = self._fb_entries_cache_key(panel)
         now = time.monotonic()
         if (panel.entries_cache_key == cache_key
@@ -9320,7 +9692,7 @@ set errorcolor=black          " error message text colour on the bottom line
         panel.cursor = max(0, min(panel.cursor, len(entries) - 1))
         panel.top_line = max(0, min(panel.top_line, max(0, len(entries) - 1)))
 
-    def _fb_selected_entry(self) -> Optional[FileBrowserEntry]:
+    def _fb_selected_entry(self) -> FileBrowserEntry | None:
         panel = self._active_fb_panel()
         entries = self._fb_entries(panel)
         if not entries:
@@ -9454,7 +9826,7 @@ set errorcolor=black          " error message text colour on the bottom line
         right_s = (f" {selected_name}{marked_s}  sort:{active.sort_mode}"
                    f"{' rev' if active.reverse_sort else ''} ")
         status = self._format_status(left_s, right_s, width)
-        _fb_prompt_cursor_col: Optional[int] = None
+        _fb_prompt_cursor_col: int | None = None
         try:
             self._draw_status_line(status_win, 0, status)
             bottom_win.move(0, 0)
@@ -9521,7 +9893,7 @@ set errorcolor=black          " error message text colour on the bottom line
                     break
         self._force_redraw = True
 
-    def _open_file_from_path(self, path: str, line_no: Optional[int] = None):
+    def _open_file_from_path(self, path: str, line_no: int | None = None):
         saved_mode = self.mode
         if not self._append_buffer(path, switch=True):
             self.mode = saved_mode
@@ -9563,7 +9935,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return self._fb_panels()[1 - self.file_browser.active_panel]
 
     @staticmethod
-    def _fb_marks_here(panel: FileBrowserPanel) -> List[str]:
+    def _fb_marks_here(panel: FileBrowserPanel) -> list[str]:
         """The panel's marks that are in its current directory -- the only
         ones drawn with '*'. Marks made elsewhere stay remembered (and show
         again on return) but never drive an operation from a directory where
@@ -9574,7 +9946,7 @@ set errorcolor=black          " error message text colour on the bottom line
             if os.path.dirname(os.path.normpath(p)) == cwd and os.path.lexists(p)
         )
 
-    def _fb_op_targets(self, panel: FileBrowserPanel) -> List[str]:
+    def _fb_op_targets(self, panel: FileBrowserPanel) -> list[str]:
         paths = self._fb_marks_here(panel)
         if paths:
             return paths
@@ -9587,13 +9959,13 @@ set errorcolor=black          " error message text colour on the bottom line
     def _fb_short_name(path: str) -> str:
         return os.path.basename(path.rstrip(os.sep)) or path
 
-    def _fb_targets_label(self, targets: List[str]) -> str:
+    def _fb_targets_label(self, targets: list[str]) -> str:
         if len(targets) == 1:
             return f"'{self._fb_short_name(targets[0])}'"
         return f"{len(targets)} items"
 
     def _fb_start_text_prompt(self, kind: str, label: str, default: str = "",
-                              payload: Optional[dict] = None):
+                              payload: dict | None = None):
         s = self.file_browser
         s.op_prompt = True
         s.op_kind = kind
@@ -9605,7 +9977,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._force_redraw = True
 
     def _fb_start_confirm(self, kind: str, label: str,
-                          payload: Optional[dict] = None):
+                          payload: dict | None = None):
         s = self.file_browser
         s.op_prompt = True
         s.op_kind = "confirm:" + kind
@@ -9693,11 +10065,11 @@ set errorcolor=black          " error message text colour on the bottom line
         self._fb_show_op_completion()
         return True
 
-    def _fb_clear_marks_for(self, paths: List[str]):
+    def _fb_clear_marks_for(self, paths: list[str]):
         for panel in self._fb_panels():
             panel.selected.difference_update(paths)
 
-    def _fb_after_op_refresh(self, focus_path: Optional[str] = None):
+    def _fb_after_op_refresh(self, focus_path: str | None = None):
         for panel in self._fb_panels():
             self._invalidate_fb_entries(panel)
         if focus_path:
@@ -9806,8 +10178,8 @@ set errorcolor=black          " error message text colour on the bottom line
         if entry:
             self._open_file_from_path(entry.path)
 
-    def _fb_resolve_dest(self, dest: str, base_cwd: str) -> Tuple[str, bool]:
-        trailing = dest.endswith("/") or dest.endswith(os.sep)
+    def _fb_resolve_dest(self, dest: str, base_cwd: str) -> tuple[str, bool]:
+        trailing = dest.endswith(("/", os.sep))
         dest = os.path.expanduser(dest)
         if not os.path.isabs(dest):
             dest = os.path.join(base_cwd, dest)
@@ -9817,7 +10189,7 @@ set errorcolor=black          " error message text colour on the bottom line
     def _fb_with_trailing_sep(path: str) -> str:
         return path if path.endswith(os.sep) else path + os.sep
 
-    _FB_SORT_MODES = ["name", "ext", "size"]
+    _FB_SORT_MODES: ClassVar[list[str]] = ["name", "ext", "size"]
 
     def _fb_cycle_sort_mode(self, panel: FileBrowserPanel):
         order = self._FB_SORT_MODES
@@ -9826,7 +10198,7 @@ set errorcolor=black          " error message text colour on the bottom line
         panel.top_line = 0
         self._invalidate_fb_entries(panel)
 
-    def _fb_estimate_op_size(self, sources: List[str]) -> Tuple[int, int, bool]:
+    def _fb_estimate_op_size(self, sources: list[str]) -> tuple[int, int, bool]:
         """Cheap upper-bound probe of an operation's total byte count and
         item count, stopping as soon as either FB_LARGE_OP_WARN_* threshold
         is crossed -- this only needs to answer "is this big enough to warn
@@ -9878,7 +10250,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return
         self._fb_start_copy_dest_prompt(targets, panel.cwd)
 
-    def _fb_start_copy_dest_prompt(self, targets: List[str], src_cwd: str):
+    def _fb_start_copy_dest_prompt(self, targets: list[str], src_cwd: str):
         other = self._fb_other_panel()
         default = self._fb_with_trailing_sep(other.cwd)
         self._fb_start_text_prompt(
@@ -9905,7 +10277,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return
         self._fb_start_move_dest_prompt(targets, panel.cwd)
 
-    def _fb_start_move_dest_prompt(self, targets: List[str], src_cwd: str):
+    def _fb_start_move_dest_prompt(self, targets: list[str], src_cwd: str):
         other = self._fb_other_panel()
         if len(targets) == 1:
             default = os.path.join(other.cwd, self._fb_short_name(targets[0]))
@@ -9988,7 +10360,7 @@ set errorcolor=black          " error message text colour on the bottom line
         signature -- only that final call differs between copy and move."""
         s = self.file_browser
         dest_text = s.op_text.strip()
-        sources: List[str] = list(s.op_payload.get("sources", []))
+        sources: list[str] = list(s.op_payload.get("sources", []))
         src_cwd = s.op_payload.get("src_cwd")
         if src_cwd is None:
             src_cwd = self._safe_getcwd(fallback=".")
@@ -10037,8 +10409,8 @@ set errorcolor=black          " error message text colour on the bottom line
             return
         self._fb_enter_dir(target)
 
-    def _fb_check_buffer_conflicts(self, pairs: List[Tuple[str, str]],
-                                   op_is_move: bool) -> Optional[str]:
+    def _fb_check_buffer_conflicts(self, pairs: list[tuple[str, str]],
+                                   op_is_move: bool) -> str | None:
         for src, tgt in pairs:
             tgt_idx = self._find_buffer_by_filename(tgt)
             if tgt_idx is None:
@@ -10056,7 +10428,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return None
 
     @classmethod
-    def _path_is_within(cls, path: Optional[str], parent: Optional[str]) -> bool:
+    def _path_is_within(cls, path: str | None, parent: str | None) -> bool:
         full_path = cls._normalize_path(path)
         full_parent = cls._normalize_path(parent)
         if not full_path or not full_parent:
@@ -10067,7 +10439,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return False
 
     @classmethod
-    def _path_is_descendant(cls, path: Optional[str], parent: Optional[str]) -> bool:
+    def _path_is_descendant(cls, path: str | None, parent: str | None) -> bool:
         full_path = cls._normalize_path(path)
         full_parent = cls._normalize_path(parent)
         if not full_path or not full_parent or full_path == full_parent:
@@ -10078,14 +10450,14 @@ set errorcolor=black          " error message text colour on the bottom line
             return False
 
     @classmethod
-    def _physical_path_is_within(cls, path: Optional[str], parent: Optional[str]) -> bool:
+    def _physical_path_is_within(cls, path: str | None, parent: str | None) -> bool:
         path, parent = cls._normalize_path(path), cls._normalize_path(parent)
         if not path or not parent:
             return False
         path, parent = os.path.realpath(path), os.path.realpath(parent)
         return os.path.commonpath([path, parent]) == parent
 
-    def _find_buffer_under_path(self, path: Optional[str]) -> Optional[int]:
+    def _find_buffer_under_path(self, path: str | None) -> int | None:
         full_path = self._normalize_path(path)
         if not full_path or not os.path.isdir(full_path):
             return None
@@ -10118,8 +10490,8 @@ set errorcolor=black          " error message text colour on the bottom line
         except OSError:
             return False
 
-    def _fb_pair_paths(self, sources: List[str], dest: str, into_dir: bool = False,
-                       op_is_move: bool = False) -> Tuple[List[Tuple[str, str]], Optional[str]]:
+    def _fb_pair_paths(self, sources: list[str], dest: str, into_dir: bool = False,
+                       op_is_move: bool = False) -> tuple[list[tuple[str, str]], str | None]:
         multi = len(sources) > 1
         # Follows a symlinked directory: "dl/" where dl -> real_dl means
         # into real_dl, not "replace the link". Only a single source with no
@@ -10134,7 +10506,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 if child != parent and self._physical_path_is_within(child, parent):
                     return [], f"Cannot operate on nested selection: '{child}' is inside '{parent}'"
         treat_as_dir = is_existing_dir and (multi or into_dir)
-        pairs: List[Tuple[str, str]] = []
+        pairs: list[tuple[str, str]] = []
         for src in sources:
             tgt = (os.path.join(dest, self._fb_short_name(src))
                    if treat_as_dir else dest)
@@ -10228,7 +10600,7 @@ set errorcolor=black          " error message text colour on the bottom line
             pass
 
     def _fb_report_batch_result(self, verb: str, succeeded: int,
-                                failures: List[Tuple[str, str]]):
+                                failures: list[tuple[str, str]]):
         """Set self.message/message_is_error for a batch op that may have
         partially failed. `failures` is a list of (path, error) pairs for
         items that were skipped so the rest of the batch could continue."""
@@ -10248,8 +10620,8 @@ set errorcolor=black          " error message text colour on the bottom line
         self.message_is_error = True
 
     def _fb_prepare_dest_op(
-            self, sources: List[str], dest: str, overwrite: bool, into_dir: bool,
-            op_is_move: bool, confirm_kind: str) -> Optional[List[Tuple[str, str]]]:
+            self, sources: list[str], dest: str, overwrite: bool, into_dir: bool,
+            op_is_move: bool, confirm_kind: str) -> list[tuple[str, str]] | None:
         """Shared by _fb_perform_copy/_fb_perform_move: pair sources with
         destinations, reject conflicts with already-open buffers, and
         (unless overwrite) start a confirmation prompt before clobbering
@@ -10283,7 +10655,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 return None
         return pairs
 
-    def _fb_overwrite_label(self, existing: List[str]) -> str:
+    def _fb_overwrite_label(self, existing: list[str]) -> str:
         """Overwrite confirmation. An existing directory at a target path is
         replaced wholesale (its whole tree deleted), not merged into, so say
         so as plainly as F8's recursive-delete prompt does rather than a
@@ -10331,7 +10703,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 f"Complete copy preserved at {tgt}; source cleanup incomplete: {exc}"
             ) from exc
 
-    def _fb_perform_copy(self, sources: List[str], dest: str,
+    def _fb_perform_copy(self, sources: list[str], dest: str,
                          overwrite: bool = False, into_dir: bool = False):
         pairs = self._fb_prepare_dest_op(
             sources, dest, overwrite, into_dir,
@@ -10340,8 +10712,8 @@ set errorcolor=black          " error message text colour on the bottom line
         if pairs is None:
             return
         succeeded = 0
-        failures: List[Tuple[str, str]] = []
-        last_target: Optional[str] = None
+        failures: list[tuple[str, str]] = []
+        last_target: str | None = None
         for src, tgt in pairs:
             try:
                 self._fb_replace_existing_target(
@@ -10355,7 +10727,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self._fb_after_op_refresh(focus_path=last_target)
         self._fb_report_batch_result("Copied", succeeded, failures)
 
-    def _fb_perform_move(self, sources: List[str], dest: str,
+    def _fb_perform_move(self, sources: list[str], dest: str,
                          overwrite: bool = False, into_dir: bool = False):
         pairs = self._fb_prepare_dest_op(
             sources, dest, overwrite, into_dir,
@@ -10368,9 +10740,9 @@ set errorcolor=black          " error message text colour on the bottom line
         # be traced back to the source by its real path.
         owners = {src: self._fb_buffers_under(src) for src, _ in pairs}
         succeeded = 0
-        moved_pairs: List[Tuple[str, str]] = []
-        failures: List[Tuple[str, str]] = []
-        last_target: Optional[str] = None
+        moved_pairs: list[tuple[str, str]] = []
+        failures: list[tuple[str, str]] = []
+        last_target: str | None = None
         for src, tgt in pairs:
             try:
                 self._fb_move_one(src, tgt)
@@ -10391,7 +10763,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self._fb_after_op_refresh(focus_path=last_target)
         self._fb_report_batch_result("Moved", succeeded, failures)
 
-    def _fb_perform_delete(self, sources: List[str], recursive: bool = False):
+    def _fb_perform_delete(self, sources: list[str], recursive: bool = False):
         self.message = ""
         self.message_is_error = False
         conflict = self._fb_delete_buffer_conflict(sources)
@@ -10399,8 +10771,8 @@ set errorcolor=black          " error message text colour on the bottom line
             self._set_error(conflict)
             return
         succeeded = 0
-        deleted: List[str] = []
-        failures: List[Tuple[str, str]] = []
+        deleted: list[str] = []
+        failures: list[tuple[str, str]] = []
         for path in sources:
             try:
                 if os.path.islink(path):
@@ -10421,7 +10793,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self._fb_after_op_refresh()
         self._fb_report_batch_result("Deleted", succeeded, failures)
 
-    def _fb_delete_buffer_conflict(self, sources: List[str]) -> Optional[str]:
+    def _fb_delete_buffer_conflict(self, sources: list[str]) -> str | None:
         for path in sources:
             idx = self._find_buffer_by_filename(path)
             if idx is None:
@@ -10432,7 +10804,7 @@ set errorcolor=black          " error message text colour on the bottom line
                         f"{idx + 1}/{len(self.buffers)} (close with :bd first)")
         return None
 
-    def _fb_buffers_under(self, src: str) -> List[Tuple[int, str]]:
+    def _fb_buffers_under(self, src: str) -> list[tuple[int, str]]:
         """(buffer index, path relative to src) for each buffer naming src or
         something beneath it -- by its path as typed, or by its real path so
         a buffer opened through a symlinked directory is found too. Must be
@@ -10456,8 +10828,8 @@ set errorcolor=black          " error message text colour on the bottom line
                     hits.append((idx, os.path.relpath(real, src_real)))
         return hits
 
-    def _fb_rebind_open_buffers(self, moved_pairs: List[Tuple[str, str]],
-                                owners: Optional[dict[str, List[Tuple[int, str]]]] = None):
+    def _fb_rebind_open_buffers(self, moved_pairs: list[tuple[str, str]],
+                                owners: dict[str, list[tuple[int, str]]] | None = None):
         for src, tgt in moved_pairs:
             tgt_norm = self._normalize_path(tgt)
             if not tgt_norm:
@@ -10488,7 +10860,7 @@ set errorcolor=black          " error message text colour on the bottom line
 
     @staticmethod
     def _rebind_signature(signature, new_filename_sig,
-                          new_file_signature: Optional[Tuple[str, str, int, int]]):
+                          new_file_signature: tuple[str, str, int, int] | None):
         if not (isinstance(signature, tuple) and signature):
             return signature
         sig = list(signature)
@@ -10693,97 +11065,293 @@ set errorcolor=black          " error message text colour on the bottom line
 
     @staticmethod
     def _fb_mask_matches(filename: str, file_mask: str) -> bool:
-        masks = [part for part in re.split(r"[\s,;]+", file_mask.strip()) if part]
-        if not masks:
-            masks = ["*"]
-        return any(fnmatch.fnmatch(filename, mask) for mask in masks)
+        return _grep_mask_matches(filename, _grep_split_masks(file_mask))
+
+    @staticmethod
+    def _terminate_grep_worker(proc) -> None:
+        """Stop and reap a grep worker, including after a timeout/cancel."""
+        if proc is None:
+            return
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        try:
+            proc.wait()
+        except OSError:
+            pass
+
+    def _grep_cancel_requested(self, stdscr) -> bool:
+        """Non-blocking Esc check used only while edit() is on the stack.
+
+        Any other key is pushed back for the overlay that opens once the scan
+        finishes, so typing during a slow grep is not silently discarded.
+        """
+        if not self._in_event_loop or stdscr is None:
+            return False
+        if not hasattr(stdscr, "timeout"):
+            return False
+        try:
+            stdscr.timeout(0)
+            try:
+                if hasattr(stdscr, "get_wch"):
+                    key = stdscr.get_wch()
+                else:
+                    key = stdscr.getch()
+            finally:
+                stdscr.timeout(-1)
+        except KeyboardInterrupt:
+            return False
+        except curses.error:
+            return False
+        if isinstance(key, str) and len(key) == 1 and ord(key) < 128:
+            key = ord(key)
+        if key in (-1, None):
+            return False
+        if key == 27:
+            return True
+        if key == curses.KEY_RESIZE:
+            self._force_redraw = True
+            return False
+        self._pending_keys.appendleft(key)
+        return False
+
+    def _show_grep_progress(self, pattern: str, count: int) -> None:
+        self.message = (f"searching for {pattern}... "
+                        f"{count} match{'es' if count != 1 else ''}")
+        self.message_is_error = False
+        self._force_redraw = True
+        try:
+            self.draw(self._stdscr)
+        except (curses.error, OSError):
+            # A resize/reinit race while painting progress must not turn a
+            # grep into a failed one.
+            pass
 
     def _run_file_browser_grep(self, root: str, pattern: str, file_mask: str = "*",
                                include_hidden: bool = False):
-        try:
-            regex = re.compile(pattern)
-            pattern_label = pattern
-        except re.error:
-            regex = re.compile(re.escape(pattern))
-            pattern_label = f"{pattern} (plain text)"
+        # The walk and regex matching live in a subprocess: unlike the shell
+        # command path there is no shell timeout to lean on, and a regex such
+        # as "(a+)+$" can spend minutes inside one search() call, where a
+        # Python-level clock check can never run. The parent enforces the same
+        # deadline plus a grace period for the worker's final summary.
+        timeout = max(0.0, float(self.FB_GREP_TIMEOUT_SECONDS))
+        request = {
+            "root": root,
+            "pattern": pattern,
+            "file_mask": file_mask,
+            "include_hidden": bool(include_hidden),
+            "timeout": timeout,
+            "max_results": int(self.FB_GREP_MAX_RESULTS),
+            "max_line_chars": int(self.FB_GREP_MAX_LINE_BYTES),
+            "preview_chars": int(self.FB_GREP_PREVIEW_CHARS),
+            "max_result_bytes": int(self.FB_GREP_MAX_RESULT_BYTES),
+        }
+        payload = (json.dumps(request) + "\n").encode("utf-8")
+        env = os.environ.copy()
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        if env.get("PYTHONPATH"):
+            env["PYTHONPATH"] = module_dir + os.pathsep + env["PYTHONPATH"]
+        else:
+            env["PYTHONPATH"] = module_dir
 
-        normalized_root = os.path.normpath(root)
-        include_hidden = include_hidden or os.path.basename(normalized_root).startswith(".")
-        results: List[GrepResult] = []
-        # Bounded like the shell-command path (SHELL_COMMAND_TIMEOUT_SECONDS /
-        # SHELL_COMMAND_MAX_OUTPUT_BYTES): an unbounded recursive walk run
-        # synchronously in the key handler would otherwise freeze the whole
-        # UI for as long as the tree takes to scan, with no way to cancel
-        # (SIGINT is ignored for the session) and no cap on memory use.
-        deadline = time.monotonic() + self.FB_GREP_TIMEOUT_SECONDS
-        truncated = False
-        for dirpath, dirnames, filenames in os.walk(root):
-            if time.monotonic() >= deadline:
-                truncated = True
-                break
-            if not include_hidden:
-                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-            for filename in sorted(filenames):
-                if not include_hidden and filename.startswith("."):
-                    continue
-                if not self._fb_mask_matches(filename, file_mask):
-                    continue
-                if len(results) >= self.FB_GREP_MAX_RESULTS or time.monotonic() >= deadline:
-                    truncated = True
-                    break
-                path = os.path.join(dirpath, filename)
+        interactive = self._in_event_loop and self._stdscr is not None
+        if interactive:
+            self._show_grep_progress(pattern, 0)
+
+        results: list[GrepResult] = []
+        summary: dict = {}
+        worker_error = ""
+        timed_out = False
+        cancelled = False
+        buffer = b""
+        proc = None
+
+        def consume(line: bytes) -> None:
+            nonlocal worker_error
+            try:
+                event = json.loads(line.decode("utf-8", "replace"))
+            except (ValueError, TypeError):
+                return
+            if not isinstance(event, dict):
+                return
+            kind = event.get("t")
+            if kind == "r":
+                path = event.get("p")
+                line_no = event.get("n")
+                text = event.get("x")
+                if (isinstance(path, str) and isinstance(line_no, int)
+                        and isinstance(text, str)):
+                    results.append(GrepResult(path, line_no, text))
+            elif kind == "s":
+                for name in ("truncated", "timed_out", "plain_text"):
+                    if isinstance(event.get(name), bool):
+                        summary[name] = event[name]
+                for name in ("skipped_files", "skipped_lines", "dir_errors"):
+                    if isinstance(event.get(name), int):
+                        summary[name] = event[name]
+                if event.get("stop_reason") in (None, "timeout", "results", "bytes"):
+                    summary["stop_reason"] = event.get("stop_reason")
+            elif kind == "e":
+                worker_error = str(event.get("m") or "grep worker failed")
+
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-c",
+                 "from vi_editor import _grep_worker_main; _grep_worker_main()"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                start_new_session=True,
+            )
+            try:
+                if proc.stdin is not None:
+                    try:
+                        proc.stdin.write(payload)
+                        proc.stdin.close()
+                    except (BrokenPipeError, OSError):
+                        pass
+                deadline = (time.monotonic() + timeout
+                            + max(0.0, float(self.FB_GREP_WORKER_GRACE_SECONDS)))
+                selector = selectors.DefaultSelector()
                 try:
-                    with _open_regular_file(path, "r", encoding="utf-8", errors="replace") as fh:
-                        line_no = 0
-                        parts: List[str] = []
-                        overlong = False
-                        while True:
-                            if time.monotonic() >= deadline:
-                                truncated = True
+                    if proc.stdout is not None:
+                        os.set_blocking(proc.stdout.fileno(), False)
+                        selector.register(proc.stdout, selectors.EVENT_READ)
+                    last_progress = -1
+                    while True:
+                        now = time.monotonic()
+                        if now >= deadline:
+                            timed_out = True
+                            self._terminate_grep_worker(proc)
+                            break
+                        if proc.poll() is not None and not selector.get_map():
+                            break
+                        events = selector.select(max(0.0, min(0.1, deadline - now)))
+                        if not events:
+                            if interactive and self._grep_cancel_requested(self._stdscr):
+                                cancelled = True
+                                self._terminate_grep_worker(proc)
                                 break
-                            # Bounded read: a file with no line breaks at
-                            # all (or one absurdly long line) must not be
-                            # able to block past the deadline in a single
-                            # call the way `for line in fh` can -- that
-                            # reads clear to the next '\n' or EOF regardless
-                            # of size, and the old per-line modulo check
-                            # never fires while still on line 1.
-                            chunk = fh.readline(self.FB_GREP_MAX_LINE_BYTES)
+                            if interactive and len(results) != last_progress:
+                                self._show_grep_progress(pattern, len(results))
+                                last_progress = len(results)
+                            if proc.poll() is not None and not selector.get_map():
+                                break
+                            continue
+                        for key, _ in events:
+                            chunk = key.fileobj.read(65536)
+                            if chunk is None:
+                                continue
+                            if not chunk:
+                                selector.unregister(key.fileobj)
+                                continue
+                            buffer += chunk
+                            while b"\n" in buffer:
+                                line, buffer = buffer.split(b"\n", 1)
+                                consume(line)
+                        if interactive and len(results) != last_progress:
+                            self._show_grep_progress(pattern, len(results))
+                            last_progress = len(results)
+                    # Keep results the worker flushed before a kill; a partial
+                    # trailing JSON line is simply ignored below.
+                    if proc.stdout is not None:
+                        while True:
+                            chunk = proc.stdout.read(65536)
                             if not chunk:
                                 break
-                            complete = (chunk.endswith("\n")
-                                        or len(chunk) < self.FB_GREP_MAX_LINE_BYTES)
-                            if not overlong:
-                                parts.append(chunk)
-                                if not complete:
-                                    overlong = True
-                            if complete:
-                                line_no += 1
-                                if not overlong:
-                                    text = "".join(parts).rstrip("\n")
-                                    if regex.search(text):
-                                        results.append(GrepResult(path, line_no, text))
-                                        if len(results) >= self.FB_GREP_MAX_RESULTS:
-                                            truncated = True
-                                            break
-                                parts = []
-                                overlong = False
-                except (OSError, UnicodeError):
-                    continue
-                if truncated:
-                    break
-            if truncated:
-                break
+                            buffer += chunk
+                finally:
+                    selector.close()
+                    if proc.stdout is not None:
+                        proc.stdout.close()
+            finally:
+                self._terminate_grep_worker(proc)
+        except OSError as exc:
+            worker_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            if proc is not None and proc.stdin is not None:
+                try:
+                    if not proc.stdin.closed:
+                        proc.stdin.close()
+                except OSError:
+                    pass
+
+        for line in buffer.split(b"\n"):
+            if line.strip():
+                consume(line)
+
+        if cancelled:
+            self.message = (f"grep cancelled after {len(results)} "
+                            f"match{'es' if len(results) != 1 else ''}")
+            self.message_is_error = False
+            self._force_redraw = True
+            return
+
+        plain_text = bool(summary.get("plain_text"))
+        pattern_label = f"{pattern} (plain text)" if plain_text else pattern
+        stop_reason = summary.get("stop_reason")
+        timed_out = timed_out or bool(summary.get("timed_out")) or stop_reason == "timeout"
+        truncated = bool(summary.get("truncated")) or timed_out
+
+        reasons: list[str] = []
+        if timed_out:
+            reasons.append("timeout")
+        elif stop_reason == "results":
+            reasons.append("result limit")
+        elif stop_reason == "bytes":
+            reasons.append("size limit")
+        skipped_files = int(summary.get("skipped_files") or 0)
+        skipped_lines = int(summary.get("skipped_lines") or 0)
+        dir_errors = int(summary.get("dir_errors") or 0)
+        if skipped_files:
+            reasons.append(f"{skipped_files} unreadable file"
+                           f"{'s' if skipped_files != 1 else ''}")
+        if dir_errors:
+            reasons.append(f"{dir_errors} unreadable dir"
+                           f"{'s' if dir_errors != 1 else ''}")
+        if skipped_lines:
+            reasons.append(f"{skipped_lines} overlong line"
+                           f"{'s' if skipped_lines != 1 else ''}")
+        if worker_error:
+            reasons.append("worker error")
+        elif not summary:
+            # Exited/was killed before it could send its summary and without
+            # an explicit error event: the scan is still incomplete.
+            truncated = True
+            reasons.append("timeout" if timed_out else "incomplete scan")
 
         self.grep_results = results
         self.grep_result_cursor = 0
         self.grep_result_top_line = 0
         self.grep_result_number = ""
-        self.grep_result_label = f"{pattern_label} in {root} ({file_mask or '*'})"
+        label = f"{pattern_label} in {root} ({file_mask or '*'})"
+        if reasons:
+            # Persist this in the label: the one-shot message is cleared by
+            # the next keypress, but a partial result set stays on screen.
+            label += f" [incomplete: {', '.join(reasons)}]"
+        self.grep_result_label = label
         self.mode = Mode.GREP_RESULTS
-        self.message = (f"{len(results)} match{'es' if len(results) != 1 else ''}"
-                        + (" (truncated)" if truncated else ""))
-        self.message_is_error = False
+        count = len(results)
+        message = f"{count} match{'es' if count != 1 else ''}"
+        if truncated or reasons:
+            message += " (truncated)"
+        if reasons:
+            message += "; " + ", ".join(reasons)
+        if worker_error:
+            self._set_error(f"grep failed: {worker_error}")
+        else:
+            self.message = message
+            self.message_is_error = False
         self._force_redraw = True
 
     def _draw_grep_results(self, stdscr, height: int, width: int):
@@ -10988,7 +11556,7 @@ set errorcolor=black          " error message text colour on the bottom line
             lines.append(f"[exit {returncode}]")
         self._open_shell_output(shell_cmd, lines)
 
-    def _run_shell_command_limited(self, shell_cmd: str, shell: str) -> Tuple[int, bytes, bool, bool]:
+    def _run_shell_command_limited(self, shell_cmd: str, shell: str) -> tuple[int, bytes, bool, bool]:
         # stdin=DEVNULL keeps children from stealing keystrokes from curses
         # (or hanging on terminal reads until the timeout); the new session
         # gives the whole pipeline its own process group so a timeout kill
@@ -11096,8 +11664,8 @@ set errorcolor=black          " error message text colour on the bottom line
     # Ex-command execution
     # -----------------------------------------------------------------------
 
-    def _insert_lines_after_cursor(self, inserted: List[str],
-                                   inserted_endings: Optional[List[str]] = None) -> int:
+    def _insert_lines_after_cursor(self, inserted: list[str],
+                                   inserted_endings: list[str] | None = None) -> int:
         if not inserted:
             return 0
         inserted_endings = list(inserted_endings or [])
@@ -11119,8 +11687,8 @@ set errorcolor=black          " error message text colour on the bottom line
         self._force_redraw = True
         return len(inserted)
 
-    def _insert_lines_after_row(self, row: int, inserted: List[str],
-                                inserted_endings: Optional[List[str]] = None) -> int:
+    def _insert_lines_after_row(self, row: int, inserted: list[str],
+                                inserted_endings: list[str] | None = None) -> int:
         old_row, old_col = self.cursor_row, self.cursor_col
         target = max(-1, min(len(self.lines) - 1, row))
         self.cursor_row = target
@@ -11230,7 +11798,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self.message = '"[No Name]" [New]'
         self._reset_view()
 
-    def _parse_line_ref(self, text: str, default: Optional[int] = None) -> Optional[int]:
+    def _parse_line_ref(self, text: str, default: int | None = None) -> int | None:
         ref = text.strip()
         if not ref:
             return default
@@ -11284,8 +11852,8 @@ set errorcolor=black          " error message text colour on the bottom line
         if self.active_register:
             self._clear_active_register()
 
-    def _store_register(self, text: List[str], is_lines: bool,
-                        line_endings: Optional[List[str]] = None,
+    def _store_register(self, text: list[str], is_lines: bool,
+                        line_endings: list[str] | None = None,
                         blockwise: bool = False):
         data = (list(text), is_lines)
         blockwise = blockwise and not is_lines
@@ -11312,7 +11880,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self.register_line_endings[self.active_register] = endings
         self._clear_active_register()
 
-    def _resolve_put_source(self) -> Tuple[List[str], bool, List[str]]:
+    def _resolve_put_source(self) -> tuple[list[str], bool, list[str]]:
         """Resolve what a put/paste/visual-replace should read: the active
         register if one was selected (consuming it), otherwise the unnamed
         yank buffer. Shared by every site that needs this -- _put(),
@@ -11331,7 +11899,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return put_buffer, put_is_lines, put_line_endings
 
     @staticmethod
-    def _put_source_is_empty(put_buffer: List[str], put_is_lines: bool) -> bool:
+    def _put_source_is_empty(put_buffer: list[str], put_is_lines: bool) -> bool:
         if not put_buffer:
             return True
         return not put_is_lines and len(put_buffer) == 1 and put_buffer[0] == ""
@@ -11425,7 +11993,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._move(row, col if exact else self._first_nonblank(row))
 
     def _resolve_text_object(self, around: bool, obj: str,
-                             count: int = 1) -> Optional[Tuple[int, int, int, int, bool]]:
+                             count: int = 1) -> tuple[int, int, int, int, bool] | None:
         if obj == "p":
             return self._paragraph_object(around, count)
         if obj != "w":
@@ -11472,7 +12040,7 @@ set errorcolor=black          " error message text colour on the bottom line
 
         return row, start, row, end, False
 
-    def _paragraph_object(self, around: bool, count: int) -> Tuple[int, int, int, int, bool]:
+    def _paragraph_object(self, around: bool, count: int) -> tuple[int, int, int, int, bool]:
         """vim's ip / ap, always linewise. A paragraph is a run of non-blank
         lines, and a run of blank (or whitespace-only) lines counts as one too.
         ip takes `count` runs from the cursor's; ap takes each paragraph with
@@ -11505,7 +12073,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 start -= 1
         return start, 0, end, len(lines[end]), True
 
-    def _find_motion_target(self, cmd: str, char: str, cnt: int) -> Optional[int]:
+    def _find_motion_target(self, cmd: str, char: str, cnt: int) -> int | None:
         line = self.lines[self.cursor_row]
         col = self.cursor_col
         found = None
@@ -11537,7 +12105,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return found
 
     def _search_motion_target(self, pattern: str, forward: bool,
-                              literal: bool = False) -> Optional[Tuple[int, int]]:
+                              literal: bool = False) -> tuple[int, int] | None:
         start = (self.cursor_row, self.cursor_col)
         old_message, old_error = self.message, self.message_is_error
         old_pattern, old_forward = self.search_pattern, self._search_forward
@@ -11557,7 +12125,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self.message_is_error = old_error
         return target
 
-    def _parse_range_prefix(self, cmd: str) -> Tuple[Optional[Tuple[int, int]], str]:
+    def _parse_range_prefix(self, cmd: str) -> tuple[tuple[int, int] | None, str]:
         text = cmd.lstrip()
         if not text.strip():
             return None, ""
@@ -11598,9 +12166,9 @@ set errorcolor=black          " error message text colour on the bottom line
             return None, text
         return (row, row), rest
 
-    def _split_ex_delimited(self, text: str, delim: str) -> Tuple[List[str], str]:
-        parts: List[str] = []
-        current: List[str] = []
+    def _split_ex_delimited(self, text: str, delim: str) -> tuple[list[str], str]:
+        parts: list[str] = []
+        current: list[str] = []
 
         idx = 0
         while idx < len(text):
@@ -11617,7 +12185,7 @@ set errorcolor=black          " error message text colour on the bottom line
         parts.append("".join(current))
         return parts, ""
 
-    def _parse_substitute_cmd(self, cmd: str) -> Optional[Tuple[int, int, str, str, str, bool]]:
+    def _parse_substitute_cmd(self, cmd: str) -> tuple[int, int, str, str, str, bool] | None:
         range_rows, rest = self._parse_range_prefix(cmd)
         explicit_range = range_rows is not None
         rest_stripped = rest.strip()
@@ -11685,7 +12253,7 @@ set errorcolor=black          " error message text colour on the bottom line
 
         return r1, r2, pattern, repl, flags, explicit_range
 
-    def _parse_global_cmd(self, cmd: str) -> Optional[Tuple[Tuple[int, int], str, str, bool]]:
+    def _parse_global_cmd(self, cmd: str) -> tuple[tuple[int, int], str, str, bool] | None:
         range_rows, rest = self._parse_range_prefix(cmd)
         name = body = None
         invert = False
@@ -11717,7 +12285,7 @@ set errorcolor=black          " error message text colour on the bottom line
         r1, r2 = range_rows or (0, len(self.lines) - 1)
         return (r1, r2), pattern, sub_cmd.strip(), invert
 
-    def _run_global_command(self, range_rows: Tuple[int, int], pattern: str,
+    def _run_global_command(self, range_rows: tuple[int, int], pattern: str,
                              sub_cmd: str, invert: bool) -> bool:
         regex = self._compile_pattern(pattern)
         if regex is None:
@@ -11787,7 +12355,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._force_redraw = True
         return result
 
-    def _parse_copy_ref(self, ref: str) -> Optional[int]:
+    def _parse_copy_ref(self, ref: str) -> int | None:
         """:c-specific line reference. Per the user spec: % = current line,
         $ = last line, N = 1-indexed line number."""
         ref = ref.strip()
@@ -11799,7 +12367,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return max(0, min(len(self.lines) - 1, int(ref) - 1))
         return None
 
-    def _parse_copy_cmd(self, cmd: str) -> Optional[Tuple[int, int]]:
+    def _parse_copy_cmd(self, cmd: str) -> tuple[int, int] | None:
         """Recognise the :c family. Returns (r1, r2) for the lines to copy,
         or None if the command isn't a :c form. Supports:
           :*c              all lines
@@ -11886,7 +12454,7 @@ set errorcolor=black          " error message text colour on the bottom line
         if not cmd:
             return True
 
-        def command_arg_from(text: str, *names: str) -> Optional[str]:
+        def command_arg_from(text: str, *names: str) -> str | None:
             for name in sorted(names, key=len, reverse=True):
                 if (text.startswith(name)
                         and len(text) > len(name)
@@ -11897,7 +12465,7 @@ set errorcolor=black          " error message text colour on the bottom line
                     return arg if arg else None
             return None
 
-        def command_arg(*names: str) -> Optional[str]:
+        def command_arg(*names: str) -> str | None:
             return command_arg_from(cmd_preserve, *names)
 
         # Pure address / line reference
@@ -12120,7 +12688,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return True
 
         if cmd == "dt-utcstamp":
-            self._insert_text_at_cursor(datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"))
+            self._insert_text_at_cursor(datetime.now(UTC).strftime("%Y%m%d%H%M%S"))
             return True
 
         if cmd == "dt-dtstamp":
@@ -12152,9 +12720,7 @@ set errorcolor=black          " error message text colour on the bottom line
 
         # :q  :q!  :quit  :quit!
         if cmd in ("q", "quit"):
-            if not self._check_unsaved_changes("quit"):
-                return True
-            return False
+            return not self._check_unsaved_changes("quit")
         if cmd in ("q!", "quit!"):
             return False
 
@@ -12228,9 +12794,7 @@ set errorcolor=black          " error message text colour on the bottom line
 
         # :wq  :wq!  :x  :xit  :exit
         if cmd == "wq!":
-            if self._save_file(force=True):
-                return False
-            return True
+            return not self._save_file(force=True)
         if cmd == "wq":
             if self._save_file():
                 if self._has_other_unsaved_changes():
@@ -12239,9 +12803,8 @@ set errorcolor=black          " error message text colour on the bottom line
                 return False
             return True
         if cmd in ("x", "xit", "exit"):
-            if self._current_buffer_is_modified():
-                if not self._save_file():
-                    return True
+            if self._current_buffer_is_modified() and not self._save_file():
+                return True
             if self._has_other_unsaved_changes():
                 self._set_error("No write since last change in another buffer (use :quit! to override)")
                 return True
@@ -12406,7 +12969,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._set_error(f"Unknown command: {cmd}")
         return True
 
-    def _apply_split_replacement(self, r: int, new_lines: List[str]):
+    def _apply_split_replacement(self, r: int, new_lines: list[str]):
         """Replace self.lines[r] with new_lines, splitting into extra rows
         when a :s replacement contained an embedded newline. Marks and
         line_endings are kept in sync: all but the last resulting line
@@ -12428,7 +12991,7 @@ set errorcolor=black          " error message text colour on the bottom line
             )
         self.lines[r:r + 1] = new_lines
 
-    def _apply_split_lines(self, r: int, new_lines: List[str]):
+    def _apply_split_lines(self, r: int, new_lines: list[str]):
         """Row/line-ending bookkeeping shared by every line-replace path,
         without the column-level mark adjustment that _apply_split_replacement
         does via _adjust_marks_for_line_replace. Callers that already know
@@ -12460,7 +13023,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self._do_substitute_confirm(r1, r2, regex, pattern, repl, flags, glob)
             return
         count = 0
-        replacements: List[Tuple[int, List[str], List[Tuple[int, int, str]]]] = []
+        replacements: list[tuple[int, list[str], list[tuple[int, int, str]]]] = []
         original_cursor = (self.cursor_row, self.cursor_col)
         last_row = self.cursor_row
         try:
@@ -12475,8 +13038,8 @@ set errorcolor=black          " error message text colour on the bottom line
                     continue
                 count += len(matches)
                 last_row = r
-                parts: List[str] = []
-                spans: List[Tuple[int, int, str]] = []
+                parts: list[str] = []
+                spans: list[tuple[int, int, str]] = []
                 last_end = 0
                 for m in matches:
                     rep_text = m.expand(repl)
@@ -12806,7 +13369,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._force_redraw = True
 
     def _begin_visual_char_change_repeat(
-        self, cnt: int, line_span: int = 0, end_col: Optional[int] = None
+        self, cnt: int, line_span: int = 0, end_col: int | None = None
     ):
         if line_span <= 0:
             self._begin_substitute_chars(cnt)
@@ -12829,7 +13392,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._force_redraw = True
 
     def _repeat_visual_char_delete(
-        self, cnt: int, line_span: int = 0, end_col: Optional[int] = None
+        self, cnt: int, line_span: int = 0, end_col: int | None = None
     ):
         r1 = self.cursor_row
         c1 = self.cursor_col
@@ -12849,7 +13412,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._force_redraw = True
 
     def _repeat_visual_toggle_case(
-        self, cnt: int, line_span: int = 0, end_col: Optional[int] = None,
+        self, cnt: int, line_span: int = 0, end_col: int | None = None,
         linewise: bool = False, fn: Callable[[str], str] = _swapcase
     ):
         """Dot-repeat target for visual ~ / u / U / r{char}: rewrite a region
@@ -12869,11 +13432,11 @@ set errorcolor=black          " error message text colour on the bottom line
         self._apply_row_changes(self._visual_text_changes(r1, c1, r2, c2, linewise, fn))
 
     def _visual_text_changes(self, r1: int, c1: int, r2: int, c2: int, linewise: bool,
-                             fn: Callable[[str], str]) -> List[Tuple[int, str]]:
+                             fn: Callable[[str], str]) -> list[tuple[int, str]]:
         """(row, new text) for each row of the selection [r1,c1]..[r2,c2]
         that `fn` actually changes; rows it leaves alone are skipped so a
         no-op costs no undo entry."""
-        changes: List[Tuple[int, str]] = []
+        changes: list[tuple[int, str]] = []
         for r in range(r1, r2 + 1):
             ln = self.lines[r]
             start = 0 if linewise or r > r1 else c1
@@ -12883,7 +13446,7 @@ set errorcolor=black          " error message text colour on the bottom line
                 changes.append((r, new))
         return changes
 
-    def _apply_row_changes(self, changes: List[Tuple[int, str]]) -> bool:
+    def _apply_row_changes(self, changes: list[tuple[int, str]]) -> bool:
         """Commit _visual_text_changes() output as one undoable edit."""
         if not changes:
             return False
@@ -12945,7 +13508,7 @@ set errorcolor=black          " error message text colour on the bottom line
         dropped again if nothing is typed after it (vim's autoindent)."""
         self._autoindent_pending = (self.cursor_row, indent) if indent else None
 
-    def _take_unused_autoindent(self, key) -> Optional[str]:
+    def _take_unused_autoindent(self, key) -> str | None:
         """Consume the pending autoindent. On Enter or ESC with nothing typed
         after it, empty that line again (a whitespace-only line is never what
         the user meant) and return the indent so Enter can carry it on."""
@@ -13011,6 +13574,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._insert_repeat_count = 1
         self._block_insert = None
         self._autoindent_pending = None
+        self._insert_arrow_used = False
 
     def _enter_insert(self):
         self._begin_insert_session(Mode.INSERT)
@@ -13022,11 +13586,42 @@ set errorcolor=black          " error message text colour on the bottom line
         self._replace_overwritten = []
         self.mode = Mode.REPLACE
 
-    def _repeat_insert_change(self, keys: List[Union[int, str]], mode: Mode,
-                              setup: Optional[Callable[[], None]] = None,
+    def _repeat_insert_change(self, keys: list[int | str], mode: Mode,
+                              setup: Callable[[], None] | None = None,
                               repeat: int = 1):
         if not keys and setup is None:
             return
+        self._insert_replaying += 1
+        try:
+            self._replay_insert_keys(keys, mode, setup, repeat)
+        finally:
+            self._insert_replaying -= 1
+
+    def _merged_insert_keys(self, keys: list[int | str]) -> list[int | str]:
+        """`keys` with each run of plain characters joined into one string,
+        which _handle_insert inserts in a single edit (the way a pasted
+        segment replays). Typing them one at a time rebuilds the line per
+        character, so replaying a long insert many times was quadratic.
+        Insert mode has no key that changes how a following printable
+        character is handled, so the result is the same text and marks."""
+        merged: list[int | str] = []
+        run: list[str] = []
+        for key in keys:
+            ch = self._text_input_char(key) if not isinstance(key, PasteSegment) else None
+            if ch is not None:
+                run.append(ch)
+                continue
+            if run:
+                merged.append(run[0] if len(run) == 1 else "".join(run))
+                run = []
+            merged.append(key)
+        if run:
+            merged.append(run[0] if len(run) == 1 else "".join(run))
+        return merged
+
+    def _replay_insert_keys(self, keys: list[int | str], mode: Mode,
+                            setup: Callable[[], None] | None, repeat: int):
+        merged = self._merged_insert_keys(keys)
         for i in range(max(1, repeat)):
             if i == 0:
                 if setup is not None:
@@ -13054,7 +13649,7 @@ set errorcolor=black          " error message text colour on the bottom line
                     # one and restore the wrong character -- the same reset
                     # _enter_replace() gives the first iteration.
                     self._replace_overwritten = []
-            for key in keys:
+            for key in (keys if self.mode == Mode.REPLACE else merged):
                 if self.mode == Mode.REPLACE:
                     self._handle_replace_mode(key)
                 else:
@@ -13103,19 +13698,24 @@ set errorcolor=black          " error message text colour on the bottom line
                     self._open_line_above()
         if self._insert_repeat_count > 1 and self._insert_replay_keys:
             keys = list(self._insert_replay_keys)
+            merged = self._merged_insert_keys(keys)
             repeat = self._insert_repeat_count
-            for _ in range(repeat - 1):
-                if self.mode == Mode.REPLACE:
-                    self._replace_overwritten = []
-                if self._insert_replay_setup == self._begin_open_line_below:
-                    self._open_line_below(auto_indent=True)
-                elif self._insert_replay_setup == self._begin_open_line_above:
-                    self._open_line_above(auto_indent=True)
-                for key in keys:
+            self._insert_replaying += 1
+            try:
+                for _ in range(repeat - 1):
                     if self.mode == Mode.REPLACE:
-                        self._handle_replace_mode(key)
-                    else:
-                        self._handle_insert(key)
+                        self._replace_overwritten = []
+                    if self._insert_replay_setup == self._begin_open_line_below:
+                        self._open_line_below(auto_indent=True)
+                    elif self._insert_replay_setup == self._begin_open_line_above:
+                        self._open_line_above(auto_indent=True)
+                    for key in (keys if self.mode == Mode.REPLACE else merged):
+                        if self.mode == Mode.REPLACE:
+                            self._handle_replace_mode(key)
+                        else:
+                            self._handle_insert(key)
+            finally:
+                self._insert_replaying -= 1
             self._insert_replay_keys = keys
             self._insert_repeat_count = 1
 
@@ -13229,8 +13829,8 @@ set errorcolor=black          " error message text colour on the bottom line
         )
 
     def _repeat_put_text(
-        self, after: bool, text: List[str], is_lines: bool,
-        line_endings: Optional[List[str]] = None
+        self, after: bool, text: list[str], is_lines: bool,
+        line_endings: list[str] | None = None
     ):
         saved_yank = list(self.yank_buffer)
         saved_is_lines = self.yank_is_lines
@@ -13249,7 +13849,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self.active_register = saved_active
 
     @staticmethod
-    def _repeat_charwise_payload(text: List[str], count: int) -> List[str]:
+    def _repeat_charwise_payload(text: list[str], count: int) -> list[str]:
         if count <= 1:
             return list(text)
         if not text:
@@ -13440,10 +14040,10 @@ set errorcolor=black          " error message text colour on the bottom line
                     )
             elif op in (">", "<"):
                 self._move(*op_start)
-                if not self._indent_lines_would_change(r1, r2 if linewise else r2, op == "<"):
+                if not self._indent_lines_would_change(r1, r2, op == "<"):
                     return
                 self._push_undo()
-                changed = self._indent_lines(r1, r2 if linewise else r2, op == "<")
+                changed = self._indent_lines(r1, r2, op == "<")
                 self._move(r1, self._first_nonblank(min(r1, len(self.lines) - 1)))
                 self.modified      = True
                 self._force_redraw = True
@@ -14296,7 +14896,7 @@ set errorcolor=black          " error message text colour on the bottom line
     def _is_completion_word_char(ch: str) -> bool:
         return ch == "_" or ch.isalnum()
 
-    def _intellisense_word_bounds(self) -> Optional[Tuple[int, int, str]]:
+    def _intellisense_word_bounds(self) -> tuple[int, int, str] | None:
         line = self.lines[self.cursor_row]
         cursor = max(0, min(self.cursor_col, len(line)))
         start = cursor
@@ -14314,7 +14914,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._intellisense_completion_complete = False
         self._intellisense_completion_context = None
 
-    def _line_completion_words(self, line: str) -> Tuple[str, ...]:
+    def _line_completion_words(self, line: str) -> tuple[str, ...]:
         if len(line) > self.MAX_INTELLISENSE_LINE_CHARS:
             # A pathologically long line (minified bundle, a single huge
             # JSON/log line) would otherwise cost one full regex scan per
@@ -14340,7 +14940,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return cached
 
     def _set_intellisense_completion_matches(
-            self, matches: List[str], prefix: str, complete: bool = True):
+            self, matches: list[str], prefix: str, complete: bool = True):
         if (
                 matches != self._intellisense_completion_matches
                 or prefix != self._intellisense_completion_prefix):
@@ -14375,7 +14975,16 @@ set errorcolor=black          " error message text colour on the bottom line
                     yield row
                     emitted += 1
 
+    # Nonzero while recorded insert keys are replayed (a count or `.`). A
+    # completion popup is never shown then, and a replay never needs one:
+    # accepting a completion is recorded as the text it inserted. Rescanning
+    # the line for every replayed key made `64.` quadratic in the line length.
+    _insert_replaying = 0
+
     def _refresh_intellisense_completion(self):
+        if self._insert_replaying:
+            self._clear_intellisense_completion()
+            return
         if not self.intellisense:
             self._clear_intellisense_completion()
             return
@@ -14407,7 +15016,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return
 
         current_row = self.cursor_row
-        matches: List[str] = []
+        matches: list[str] = []
         seen = set()
         # Rows past the scan bound are never seen, so the set isn't exhaustive.
         complete = len(self.lines) <= self.MAX_INTELLISENSE_SCAN_LINES
@@ -14493,7 +15102,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return True
 
     @staticmethod
-    def _text_input_char(key) -> Optional[str]:
+    def _text_input_char(key) -> str | None:
         if isinstance(key, str):
             return key if len(key) == 1 and key.isprintable() else None
         if not isinstance(key, int):
@@ -14505,7 +15114,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return None
 
     def _edit_line_key(self, text: str, cursor: int, key,
-                       min_cursor: int = 0) -> Optional[Tuple[str, int]]:
+                       min_cursor: int = 0) -> tuple[str, int] | None:
         """Apply one editing key to a single-line input field. Returns the
         new (text, cursor), or None if the key is not a line-editing key."""
         if key == curses.KEY_LEFT:
@@ -14529,17 +15138,52 @@ set errorcolor=black          " error message text colour on the bottom line
             return text[:cursor] + ch + text[cursor:], cursor + 1
         return None
 
-    def _handle_insert(self, key: Union[int, str]) -> bool:
+    # Cursor keys in INSERT / REPLACE (Ctrl-A Ctrl-E arrows Home End PgUp PgDn).
+    _INSERT_MOTION_KEYS = frozenset((
+        1, 5, curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_UP, curses.KEY_DOWN,
+        curses.KEY_HOME, curses.KEY_END, curses.KEY_NPAGE, curses.KEY_PPAGE,
+    ))
+
+    def _note_insert_motion(self, key: int) -> None:
+        """vim's start_arrow(): a cursor key ends what `.` and an insert count
+        repeat. A block insert still records it -- its replay must leave the
+        first row the same way to skip replication, as the live insert did."""
+        if self._block_insert is not None:
+            self._insert_replay_keys.append(key)
+            return
+        self._insert_arrow_used = True
+        self._insert_repeat_count = 1
+
+    def _resume_insert_after_motion(self) -> None:
+        """vim's stop_arrow(): the first edit after a cursor key closes the
+        undo step for the text typed before it and starts a fresh plain
+        insert (or replace) at the cursor for `.` -- so `.` never replays a
+        motion onto other lines."""
+        if not self._insert_arrow_used:
+            return
+        self._insert_arrow_used = False
+        if self._insert_pre_state is not None and self._insert_state_changed():
+            self._append_undo_state(self._insert_pre_state)
+            self._insert_pre_state = self._snapshot_undo_baseline()
+            self._insert_pre_revision = self._content_revision
+        self._insert_replay_keys = []
+        self._insert_replay_setup = None
+        self._insert_empty_replay = None
+        self._insert_repeat_count = 1
+
+    def _handle_insert(self, key: int | str) -> bool:
         carry_indent = self._take_unused_autoindent(key)
+        if key not in self._INSERT_MOTION_KEYS and key not in (27, 14):
+            self._resume_insert_after_motion()
         if key == 27:                                       # ESC
             self._clear_intellisense_completion()
             self._leave_insert()
         elif key == 1:                                      # Ctrl-A
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_insert_cursor(self.cursor_row, 0)
             self._refresh_intellisense_completion()
         elif key == 5:                                      # Ctrl-E
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_insert_cursor(self.cursor_row, len(self.lines[self.cursor_row]))
             self._refresh_intellisense_completion()
         elif key == 14:                                     # Ctrl-N
@@ -14570,35 +15214,35 @@ set errorcolor=black          " error message text colour on the bottom line
             self._detab_before_cursor()
             self._refresh_intellisense_completion()
         elif key == curses.KEY_LEFT:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_insert_cursor(self.cursor_row, self.cursor_col - 1)
             self._refresh_intellisense_completion()
         elif key == curses.KEY_RIGHT:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_insert_cursor(self.cursor_row, self.cursor_col + 1)
             self._refresh_intellisense_completion()
         elif key == curses.KEY_UP:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_screen_vertical(-1)
             self._refresh_intellisense_completion()
         elif key == curses.KEY_DOWN:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_screen_vertical(1)
             self._refresh_intellisense_completion()
         elif key == curses.KEY_HOME:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_insert_cursor(self.cursor_row, 0)
             self._refresh_intellisense_completion()
         elif key == curses.KEY_END:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_insert_cursor(self.cursor_row, len(self.lines[self.cursor_row]))
             self._refresh_intellisense_completion()
         elif key == curses.KEY_NPAGE:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._page_move_keep_col(1)
             self._refresh_intellisense_completion()
         elif key == curses.KEY_PPAGE:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._page_move_keep_col(-1)
             self._refresh_intellisense_completion()
         elif key in (curses.KEY_DC, 4):                      # Delete / Ctrl-D
@@ -14621,16 +15265,18 @@ set errorcolor=black          " error message text colour on the bottom line
         self._clamp_marks()
         return True
 
-    def _handle_replace_mode(self, key: Union[int, str]) -> bool:
+    def _handle_replace_mode(self, key: int | str) -> bool:
         carry_indent = self._take_unused_autoindent(key)
+        if key not in self._INSERT_MOTION_KEYS and key != 27:
+            self._resume_insert_after_motion()
         if key == 27:
             self._clear_intellisense_completion()
             self._leave_insert()
         elif key == 1:                                      # Ctrl-A
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_insert_cursor(self.cursor_row, 0)
         elif key == 5:                                      # Ctrl-E
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_insert_cursor(self.cursor_row, len(self.lines[self.cursor_row]))
         elif key == ord("\t"):
             self._insert_replay_keys.append(key)
@@ -14646,28 +15292,28 @@ set errorcolor=black          " error message text colour on the bottom line
             self._insert_replay_keys.append(key)
             self._delete_char_under_insert_cursor()
         elif key == curses.KEY_LEFT:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_insert_cursor(self.cursor_row, self.cursor_col - 1)
         elif key == curses.KEY_RIGHT:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_insert_cursor(self.cursor_row, self.cursor_col + 1)
         elif key == curses.KEY_UP:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_screen_vertical(-1)
         elif key == curses.KEY_DOWN:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_screen_vertical(1)
         elif key == curses.KEY_HOME:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_insert_cursor(self.cursor_row, 0)
         elif key == curses.KEY_END:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._move_insert_cursor(self.cursor_row, len(self.lines[self.cursor_row]))
         elif key == curses.KEY_NPAGE:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._page_move_keep_col(1)
         elif key == curses.KEY_PPAGE:
-            self._insert_replay_keys.append(key)
+            self._note_insert_motion(key)
             self._page_move_keep_col(-1)
         elif key in self._ENTER_KEYS:
             self._insert_replay_keys.append(key)
@@ -14709,6 +15355,7 @@ set errorcolor=black          " error message text colour on the bottom line
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         if not text:
             return
+        self._resume_insert_after_motion()
         segments = text.split("\n")
         for i, segment in enumerate(segments):
             if i > 0:
@@ -14729,7 +15376,10 @@ set errorcolor=black          " error message text colour on the bottom line
             self._replace_overwritten.append((self.cursor_row, c, line[c]))
             self.lines[self.cursor_row] = line[:c] + ch + line[c + 1:]
         else:
-            self._adjust_marks_for_line_replace(self.cursor_row, line, line + ch)
+            # An append: the same result as diffing line against line + ch,
+            # without rescanning the whole line for every character typed
+            # (a counted R replays thousands, which made it quadratic).
+            self._adjust_marks_for_same_line_insert(self.cursor_row, len(line), 1)
             self._replace_overwritten.append((self.cursor_row, c, None))
             self.lines[self.cursor_row] = line + ch
         self.cursor_col += 1
@@ -14742,6 +15392,7 @@ set errorcolor=black          " error message text colour on the bottom line
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         if not text:
             return
+        self._resume_insert_after_motion()
         segments = text.split("\n")
         for i, segment in enumerate(segments):
             if i > 0:
@@ -14757,7 +15408,7 @@ set errorcolor=black          " error message text colour on the bottom line
     # cursor (row, col) it left -- backspace there joins the lines again.
     _REPLACE_NEWLINE = object()
 
-    def _replace_newline(self, auto_indent: bool = True, indent: Optional[str] = None):
+    def _replace_newline(self, auto_indent: bool = True, indent: str | None = None):
         self._newline(auto_indent=auto_indent, indent=indent)
         self._replace_overwritten.append(
             (self.cursor_row, self.cursor_col, self._REPLACE_NEWLINE))
@@ -14960,7 +15611,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self.modified       = True
             self._force_redraw  = True
 
-    def _newline(self, auto_indent: bool = True, indent: Optional[str] = None):
+    def _newline(self, auto_indent: bool = True, indent: str | None = None):
         line   = self.lines[self.cursor_row]
         split_row = self.cursor_row
         split_col = self.cursor_col
@@ -15054,13 +15705,7 @@ set errorcolor=black          " error message text colour on the bottom line
             return result
         if key == ord("$") and not prev_pending:
             self._block_to_eol = True
-        elif isinstance(key, int) and ord("0") <= key <= ord("9") and self._count_str:
-            pass
-        elif not prev_pending and key in self._BLOCK_EOL_KEEP_KEYS:
-            pass
-        elif prev_pending == "g" and key in (ord("j"), ord("k")):
-            pass
-        elif prev_pending == '"':
+        elif isinstance(key, int) and ord("0") <= key <= ord("9") and self._count_str or not prev_pending and key in self._BLOCK_EOL_KEEP_KEYS or prev_pending == "g" and key in (ord("j"), ord("k")) or prev_pending == '"':
             pass
         else:
             self._block_to_eol = False
@@ -15530,17 +16175,17 @@ set errorcolor=black          " error message text colour on the bottom line
     # Command-buffer handler  (: / ?)
     # -----------------------------------------------------------------------
 
-    _FILENAME_EX_COMMANDS = {
+    _FILENAME_EX_COMMANDS: ClassVar[set[str]] = {
         "b64d", "b64e", "badd",
         "e", "edit", "file", "f",
         "r", "read",
         "w", "write",
         "cd", "chdir",
     }
-    _FILENAME_BANG_EX_COMMANDS = {"e", "edit", "w", "write"}
-    _DIR_ONLY_EX_COMMANDS = {"cd", "chdir"}
+    _FILENAME_BANG_EX_COMMANDS: ClassVar[set[str]] = {"e", "edit", "w", "write"}
+    _DIR_ONLY_EX_COMMANDS: ClassVar[set[str]] = {"cd", "chdir"}
 
-    _SET_OPTIONS: List[str] = sorted([
+    _SET_OPTIONS: list[str] = sorted([
         "expandtab", "noexpandtab",
         "backup", "nobackup", "invbackup",
         "visualmarks", "novisualmarks", "invvisualmarks",
@@ -15563,7 +16208,7 @@ set errorcolor=black          " error message text colour on the bottom line
         "errorcolor=", "errorfg=",
     ])
 
-    def _set_opt_completion_bounds(self) -> Optional[Tuple[int, int, str]]:
+    def _set_opt_completion_bounds(self) -> tuple[int, int, str] | None:
         """Returns (start, end, prefix) for :set option completion, or None."""
         if not self._cmd_buf.startswith(":"):
             return None
@@ -15637,7 +16282,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self.message = "  ".join(parts) + more
         self.message_is_error = False
 
-    def _filename_completion_bounds(self) -> Optional[Tuple[int, int, str, bool, str]]:
+    def _filename_completion_bounds(self) -> tuple[int, int, str, bool, str] | None:
         if not self._cmd_buf.startswith(":"):
             return None
         text = self._cmd_buf[1:]
@@ -15654,7 +16299,7 @@ set errorcolor=black          " error message text colour on the bottom line
         # off while command_offset stayed 0, so every offset computed from
         # it below pointed too far right, letting the command letter itself
         # get treated as (and overwritten by) the filename prefix.
-        range_rows, command_text = self._parse_range_prefix(before_cursor)
+        _range_rows, command_text = self._parse_range_prefix(before_cursor)
         command_offset = len(before_cursor) - len(command_text)
         m = re.match(r"\s*(\S+)", command_text)
         if not m:
@@ -15684,7 +16329,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self._filename_completion_needs_space = False
 
     def _set_filename_completion_matches(
-            self, matches: List[str], prefix: str, needs_space: bool):
+            self, matches: list[str], prefix: str, needs_space: bool):
         self._cmd_history_index = None
         self._cmd_history_draft = self._cmd_buf
         if matches != self._filename_completion_matches or prefix != self._filename_completion_prefix:
@@ -15733,7 +16378,7 @@ set errorcolor=black          " error message text colour on the bottom line
         return True
 
     @staticmethod
-    def _list_path_completions(prefix: str, dirs_only: bool = False) -> List[str]:
+    def _list_path_completions(prefix: str, dirs_only: bool = False) -> list[str]:
         """List filesystem completions for a (possibly ~-prefixed, possibly
         relative) path fragment, in the same textual style as `prefix`."""
         expanded = os.path.expanduser(prefix)
@@ -15811,7 +16456,7 @@ set errorcolor=black          " error message text colour on the bottom line
         self.message_is_error = False
         return True
 
-    def _handle_cmd_buf(self, key: int) -> Optional[bool]:
+    def _handle_cmd_buf(self, key: int) -> bool | None:
         """
         Returns None  → still accumulating input
         Returns True  → finished, continue editing
@@ -15832,7 +16477,7 @@ set errorcolor=black          " error message text colour on the bottom line
             self.message  = ""
             self.message_is_error = False
 
-            if buf.startswith("/") or buf.startswith("?") or buf.startswith("\\"):
+            if buf.startswith(("/", "?", "\\")):
                 forward = buf[0] != "?"
                 literal = buf[0] == "\\"
                 pattern = buf[1:]
@@ -15856,7 +16501,7 @@ set errorcolor=black          " error message text colour on the bottom line
             else:
                 try:
                     result = self._execute_cmd(buf)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - see the comment below
                     # A bug in one ex command must not take down the whole
                     # session; report it like any other command failure and
                     # keep editing (unsaved buffers stay intact).
@@ -15867,10 +16512,9 @@ set errorcolor=black          " error message text colour on the bottom line
             return True
 
         if key == ord("\t"):
-            if not self._complete_set_opt(forward=True):
-                if not self._complete_cmd_filename():
-                    self.message = ""
-                    self.message_is_error = False
+            if not self._complete_set_opt(forward=True) and not self._complete_cmd_filename():
+                self.message = ""
+                self.message_is_error = False
             self._cmd_history_index = None
             self._cmd_history_draft = self._cmd_buf
             return None
@@ -15988,7 +16632,7 @@ set errorcolor=black          " error message text colour on the bottom line
             raise
         return None if key == -1 else key
 
-    def _match_escape_tail(self, stdscr, expected: str, timeout_ms: Optional[int]) -> bool:
+    def _match_escape_tail(self, stdscr, expected: str, timeout_ms: int | None) -> bool:
         """After an ESC (27) has just been read, check whether `expected`
         (e.g. "[200~") follows immediately. On a full match, consumes those
         keys and returns True. On a mismatch -- including a timeout, when
@@ -16190,15 +16834,14 @@ set errorcolor=black          " error message text colour on the bottom line
                 self._clear_cmd_buf()
             self._set_error(f'"{self.filename}" shrank on disk; reloaded')
 
-    def _dispatch_key(self, key: Union[int, str], stdscr) -> bool:
+    def _dispatch_key(self, key: int | str, stdscr) -> bool:
         """Handle one already-read key exactly as the main loop would.
         Returns False if the program should exit. Factored out so
         bracketed-paste replay outside insert/replace mode (see
         _handle_bracketed_paste) can feed pasted characters through the
         same path as normally typed ones."""
-        if self._pending_confirmation is not None:
-            if self._handle_pending_confirmation(key):
-                return True
+        if self._pending_confirmation is not None and self._handle_pending_confirmation(key):
+            return True
 
         if self._is_ignored_control_key(key):
             return True
@@ -16215,9 +16858,7 @@ set errorcolor=black          " error message text colour on the bottom line
         # Command buffer takes precedence
         if self._cmd_buf:
             result = self._handle_cmd_buf(key)
-            if result is False:
-                return False
-            return True
+            return result is not False
 
         # Mode dispatch
         height, width = stdscr.getmaxyx()
@@ -16252,6 +16893,7 @@ set errorcolor=black          " error message text colour on the bottom line
 
     def edit(self, stdscr: curses.window) -> None:
         self._stdscr = stdscr
+        self._in_event_loop = True
         try:
             curses.curs_set(1)
         except curses.error:
@@ -16353,16 +16995,14 @@ set errorcolor=black          " error message text colour on the bottom line
             self.crash_dump_paths = self._dump_crash_recovery()
             raise
         finally:
+            self._in_event_loop = False
             self._disable_bracketed_paste()
-            try:
+            # A crash already in flight must not be replaced by a secondary
+            # failure here (e.g. corrupted mark/cursor state from the same bug
+            # that triggered the crash) -- see _dump_crash_recovery's same
+            # "never raise while unwinding" contract.
+            with contextlib.suppress(Exception):
                 self._save_session()
-            except Exception:
-                # A crash already in flight must not be replaced by a
-                # secondary failure here (e.g. corrupted mark/cursor state
-                # from the same bug that triggered the crash) -- see
-                # _dump_crash_recovery's same "never raise while unwinding"
-                # contract.
-                pass
             for sig, old_handler in reversed(old_signal_handlers):
                 try:
                     signal.signal(sig, old_handler)
@@ -16377,7 +17017,7 @@ ViEditor = ViiEditor
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _parse_session_line(line: str) -> Optional[Tuple[str, int, int, dict[str, Tuple[int, int]], dict[int, int]]]:
+def _parse_session_line(line: str) -> tuple[str, int, int, dict[str, tuple[int, int]], dict[int, int]] | None:
     """Parse one session record.
 
     Current records use a JSON string for the path followed by row, column, an
@@ -16417,7 +17057,7 @@ def _parse_session_line(line: str) -> Optional[Tuple[str, int, int, dict[str, Tu
     except ValueError:
         return None
 
-    marks: dict[str, Tuple[int, int]] = {}
+    marks: dict[str, tuple[int, int]] = {}
     if marks_text:
         try:
             raw_marks = json.loads(marks_text)
@@ -16453,9 +17093,9 @@ def _parse_session_line(line: str) -> Optional[Tuple[str, int, int, dict[str, Tu
     return path, row, col, marks, auto_marks
 
 
-def _read_session_filenames() -> List[str]:
+def _read_session_filenames() -> list[str]:
     """Return file paths from the session file that still exist on disk."""
-    paths: List[str] = []
+    paths: list[str] = []
     seen: set[str] = set()
     try:
         with open(ViiEditor.SESSION_PATH, "r", encoding="utf-8", errors="replace") as fh:
@@ -16476,7 +17116,7 @@ def _read_session_filenames() -> List[str]:
     return paths
 
 
-def _resolve_project_filenames(name: str) -> Tuple[Optional[List[str]], Optional[str]]:
+def _resolve_project_filenames(name: str) -> tuple[list[str] | None, str | None]:
     """(filenames, error) for project *name*. Exactly one of the two is None.
 
     Distinguishes "no such project" from "couldn't read the session file" --
@@ -16491,7 +17131,7 @@ def _resolve_project_filenames(name: str) -> Tuple[Optional[List[str]], Optional
         return None, f"could not read {ViiEditor.SESSION_PATH}: {exc}"
     if name not in sections:
         return None, f"no such project: {name}"
-    paths: List[str] = []
+    paths: list[str] = []
     seen: set[str] = set()
     for p in sections[name]:
         normalized = ViiEditor._normalize_path(p)
@@ -16511,11 +17151,11 @@ _CLI_FLAG_ATTRS = {
 }
 
 
-def _parse_cli_flags(argv: List[str]) -> Tuple[dict, List[str]]:
+def _parse_cli_flags(argv: list[str]) -> tuple[dict, list[str]]:
     """Pull -ns/-nb/-ro (and their long -- forms) out of argv, wherever they
     appear, leaving the rest (e.g. -p name, or filenames) untouched."""
     flags = {"no_session_save": False, "no_backup": False, "read_only": False}
-    remaining: List[str] = []
+    remaining: list[str] = []
     for arg in argv:
         attr = _CLI_FLAG_ATTRS.get(arg)
         if attr is not None:
@@ -16525,7 +17165,7 @@ def _parse_cli_flags(argv: List[str]) -> Tuple[dict, List[str]]:
     return flags, remaining
 
 
-def _resolve_startup_filenames(argv: List[str]) -> Tuple[Optional[List[str]], Optional[str]]:
+def _resolve_startup_filenames(argv: list[str]) -> tuple[list[str] | None, str | None]:
     """Turn sys.argv[1:] into (filenames, error). Exactly one of the two is None."""
     if argv and argv[0] == "-p":
         if len(argv) != 2 or not argv[1]:
@@ -16560,7 +17200,7 @@ def main() -> int:
         editor.read_only = True
     try:
         curses.wrapper(editor.edit)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - top level: report, then point at crash dumps
         print(f"Error: {exc}", file=sys.stderr)
         import traceback
         traceback.print_exc()
