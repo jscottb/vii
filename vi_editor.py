@@ -1499,6 +1499,7 @@ class ViiEditor:
         "  :buffers  :ls        open buffer list",
         "  :b N                 switch to buffer N",
         "  :bn  :bp             next / previous buffer",
+        "  :bl  Ctrl-^          back to the last-used buffer (toggles)",
         "  :badd file           add file without switching",
         "  :bd  :bd!            delete buffer (! discards changes)",
         "  Buffer list          q/ESC close  j/k navigate  PgUp/PgDn page  gg/G top/bottom",
@@ -1874,6 +1875,9 @@ class ViiEditor:
         self.function_list_searching: bool = False
         self.buffers: list[BufferState] = []
         self.current_buffer = 0
+        # buffer_id of the buffer that was active before the most recent
+        # user-initiated buffer switch; :bl jumps back to it.
+        self._prev_buffer_id: object | None = None
         self._session_cache: dict | None = None  # loaded lazily, reset on save
 
         # Last f/F/t/T
@@ -3723,8 +3727,20 @@ set errorcolor=black          " error message text colour on the bottom line
             self._set_error("No such buffer")
             return
         self._sync_current_buffer()
+        if index != self.current_buffer:
+            self._prev_buffer_id = self._buffer_id
         self._load_buffer_state(index)
         self.message = f"Buffer {index + 1}/{len(self.buffers)}: {self._current_file_label()}"
+
+    def _switch_to_previous_buffer(self):
+        """:bl -- go back to the buffer that was active before the last switch."""
+        prev_id = self._prev_buffer_id
+        index = next((i for i, b in enumerate(self.buffers)
+                      if b.buffer_id is prev_id), None) if prev_id is not None else None
+        if index is None or index == self.current_buffer:
+            self._set_error("No previous buffer")
+            return
+        self._switch_buffer(index)
 
     def _find_buffer_by_filename(self, filename: str | None,
                                  exclude_index: int | None = None) -> int | None:
@@ -3763,6 +3779,7 @@ set errorcolor=black          " error message text colour on the bottom line
                        force_reload_existing: bool = False) -> bool:
         self._sync_current_buffer()
         old_index = self.current_buffer
+        old_buffer_id = self._buffer_id
         full_filename = self._normalize_path(filename)
         # If the file is already open in another buffer, switch to it instead of
         # creating a duplicate with its own diverging undo history.
@@ -3785,6 +3802,8 @@ set errorcolor=black          " error message text colour on the bottom line
                     if existing_index != old_index:
                         self._load_buffer_state(old_index)
                     return False
+                if switch and existing_index != old_index:
+                    self._prev_buffer_id = old_buffer_id
                 return True
         state = BufferState(
             full_filename,
@@ -3824,6 +3843,8 @@ set errorcolor=black          " error message text colour on the bottom line
                     if not switch:
                         self._load_buffer_state(old_index)
                         self.message = f"Buffer added: {full_filename or '[No Name]'}"
+                    else:
+                        self._prev_buffer_id = old_buffer_id
                     return True
                 del self.buffers[new_index]
                 if self.buffers:
@@ -3836,6 +3857,8 @@ set errorcolor=black          " error message text colour on the bottom line
         if not switch:
             self._load_buffer_state(old_index)
             self.message = f"Buffer added: {full_filename or '[No Name]'}"
+        else:
+            self._prev_buffer_id = old_buffer_id
         return True
 
     def _delete_current_buffer(self, force: bool = False):
@@ -12594,6 +12617,10 @@ set errorcolor=black          " error message text colour on the bottom line
             self._switch_buffer((self.current_buffer - 1) % len(self.buffers))
             return True
 
+        if cmd == "bl":
+            self._switch_to_previous_buffer()
+            return True
+
         if cmd in ("bd", "bdelete"):
             self._delete_current_buffer(False)
             return True
@@ -14866,6 +14893,11 @@ set errorcolor=black          " error message text colour on the bottom line
                 f' {len(self.lines)}L '
                 f'-- {self.cursor_row + 1}/{len(self.lines)} ({pct}%) --'
             )
+
+        # --- Alternate buffer (Ctrl-^ / Ctrl-6), same as :bl ---
+        elif key == 30:
+            self._count_str = ""
+            self._switch_to_previous_buffer()
 
         # --- Home / End ---
         elif key == curses.KEY_HOME:

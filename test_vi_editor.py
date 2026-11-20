@@ -3513,6 +3513,70 @@ class ExCommandTests(unittest.TestCase):
             self.assertTrue(editor._execute_cmd(":bn"))
             self.assertEqual(editor.filename, two)
 
+    def test_bl_returns_to_last_used_buffer_and_toggles(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            names = []
+            for n in ("a", "b", "c"):
+                path = os.path.join(tmpdir, f"{n}.txt")
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(f"{n}\n")
+                names.append(path)
+            a, b, c = names
+
+            editor = ViEditor(names)
+            self.assertTrue(editor._execute_cmd(":bl"))
+            self.assertTrue(editor.message_is_error)
+            self.assertEqual(editor.filename, a)
+
+            self.assertTrue(editor._execute_cmd(":b 3"))
+            self.assertEqual(editor.filename, c)
+            self.assertTrue(editor._execute_cmd(":bl"))
+            self.assertEqual(editor.filename, a)
+            self.assertTrue(editor._execute_cmd(":bl"))
+            self.assertEqual(editor.filename, c)
+
+            # Switching via :edit to an already-open file is remembered too.
+            self.assertTrue(editor._execute_cmd(f":edit {b}"))
+            self.assertEqual(editor.filename, b)
+            self.assertTrue(editor._execute_cmd(":bl"))
+            self.assertEqual(editor.filename, c)
+
+            # Previous buffer survives reordering of the buffer list.
+            editor._move_buffer_in_list(1, -1)  # b moves to index 0
+            self.assertTrue(editor._execute_cmd(":bl"))
+            self.assertEqual(editor.filename, b)
+
+    def test_ctrl_caret_in_normal_mode_acts_like_bl(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            one = os.path.join(tmpdir, "one.txt")
+            two = os.path.join(tmpdir, "two.txt")
+            for path in (one, two):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("x\n")
+            editor = ViEditor([one, two])
+            self.assertTrue(editor._execute_cmd(":bn"))
+            self.assertEqual(editor.filename, two)
+            self.assertTrue(editor._handle_normal(30, 24, 80))
+            self.assertEqual(editor.filename, one)
+            self.assertTrue(editor._handle_normal(30, 24, 80))
+            self.assertEqual(editor.filename, two)
+
+    def test_bl_errors_when_previous_buffer_deleted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            one = os.path.join(tmpdir, "one.txt")
+            two = os.path.join(tmpdir, "two.txt")
+            for path in (one, two):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("x\n")
+            editor = ViEditor([one, two])
+            self.assertTrue(editor._execute_cmd(":bn"))
+            self.assertTrue(editor._execute_cmd(":b 1"))
+            self.assertTrue(editor._execute_cmd(":bd"))
+            self.assertEqual(editor.filename, two)
+            self.assertTrue(editor._execute_cmd(":bl"))
+            self.assertTrue(editor.message_is_error)
+            self.assertEqual(editor.filename, two)
+
     def test_constructor_loads_multiple_files_as_buffers(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             one = os.path.join(tmpdir, "one.txt")
